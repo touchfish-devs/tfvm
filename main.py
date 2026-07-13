@@ -28,7 +28,7 @@ COLORS = {
 def colorize(text, color):
     return f"{COLORS.get(color, '')}{text}{COLORS['RESET']}"
 
-# ---------- 进度条支持（尝试导入 tqdm） ----------
+# ---------- 进度条支持 ----------
 try:
     from tqdm import tqdm
     HAS_TQDM = True
@@ -80,15 +80,15 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 # ---------- 常量 ----------
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 DEFAULT_CONFIG = {
-    "registry": "https://reg.touchfish.us.ci/db.yml",      # 数据库 URL
+    "registry": "https://reg.touchfish.us.ci/db.yml",
     "sudo_at_start": False,
     "install_prefix": "/usr/local",
     "install_root": "/opt/tfvm",
     "cache_dir": "~/.tfvm/cache",
-    "db_file": "~/.tfvm/db.yml",                          # 本地数据库文件
+    "db_file": "~/.tfvm/db.yml",
     "installed_db": "~/.tfvm/installed.json"
 }
 
@@ -181,7 +181,7 @@ class PackageDB:
             logger.error(f"同步数据库失败: {e}")
             sys.exit(1)
 
-        # ---------- 确保 tfvm 自身包存在 ----------
+        # 确保 tfvm 自身包存在
         if 'tfvm' not in self.packages:
             self.packages['tfvm'] = {
                 'Name': 'tfvm',
@@ -297,10 +297,60 @@ class TfvmManager:
         with tarfile.open(tarball, 'r:gz') as tar:
             tar.extractall(dest_dir)
 
+    def _check_path_conflict(self, pkg_name: str):
+        """
+        检查系统中是否存在同名的可执行文件，并判断其与 /usr/local/bin 的优先级关系。
+        返回 (status, message)
+        status: 'none', 'conflict', 'occupied_ahead', 'occupied_behind'
+        """
+        import shutil
+        # 查找当前 PATH 中的第一个匹配
+        existing_path = shutil.which(pkg_name)
+        if existing_path is None:
+            return 'none', ''
+
+        target_path = os.path.join(self.bin_dir, pkg_name)
+        # 如果已存在且路径就是我们的目标位置，则冲突
+        if existing_path == target_path:
+            return 'conflict', f"路径 {target_path} 已被占用，可能是系统包或手动安装，与 tfvm 安装位置冲突。"
+
+        # 获取 PATH 列表
+        path_list = os.environ.get('PATH', '').split(os.pathsep)
+        # 找到 /usr/local/bin 的索引
+        try:
+            local_idx = path_list.index(self.bin_dir)
+        except ValueError:
+            # /usr/local/bin 不在 PATH 中，不会影响
+            return 'none', ''
+
+        # 找到外部路径所在目录的索引
+        dirname = os.path.dirname(existing_path)
+        try:
+            ext_idx = path_list.index(dirname)
+        except ValueError:
+            # 理论上不会发生，因为 which 能找到它
+            return 'none', ''
+
+        if ext_idx < local_idx:
+            return 'occupied_ahead', f"外部包 {existing_path} 在 PATH 中优先于 {self.bin_dir}，建议卸载外部包。"
+        elif ext_idx > local_idx:
+            return 'occupied_behind', f"外部包 {existing_path} 在 PATH 中位于 {self.bin_dir} 之后，tfvm 将覆盖该命令，建议卸载外部包。"
+        else:
+            # 不会发生
+            return 'none', ''
+
     def _install_pkg(self, pkg_name: str, pkg_info: dict):
         if self.installed.is_installed(pkg_name):
             logger.info(f"包 {pkg_name} 已安装，跳过")
             return
+
+        # 冲突检查（在下载前进行）
+        status, msg = self._check_path_conflict(pkg_name)
+        if status == 'conflict':
+            logger.error(f"包 {pkg_name}: {msg}")
+            sys.exit(1)
+        elif status in ('occupied_ahead', 'occupied_behind'):
+            logger.warning(f"包 {pkg_name}: {msg}")
 
         version = pkg_info.get('Version')
         if not version:
@@ -414,6 +464,26 @@ class TfvmManager:
         if not to_install:
             logger.info("所有包已安装")
             return
+
+        # ---------- 冲突检查 ----------
+        conflicts = []
+        warnings = []
+        for pkg in to_install:
+            status, msg = self._check_path_conflict(pkg)
+            if status == 'conflict':
+                conflicts.append((pkg, msg))
+            elif status in ('occupied_ahead', 'occupied_behind'):
+                warnings.append((pkg, msg))
+
+        if conflicts:
+            logger.error("以下包与现有文件冲突，无法安装：")
+            for pkg, msg in conflicts:
+                logger.error(f"  {pkg}: {msg}")
+            sys.exit(1)
+        if warnings:
+            logger.warning("以下包存在路径冲突，建议处理：")
+            for pkg, msg in warnings:
+                logger.warning(f"  {pkg}: {msg}")
 
         logger.info(f"将安装以下包: {', '.join(to_install)}")
         confirm = input(colorize("确认安装吗？(Y/n): ", 'YELLOW')).strip().lower()
@@ -544,7 +614,7 @@ class TfvmManager:
             sys.exit(1)
         os.execv(exec_path, [exec_path] + sys.argv[2:])
 
-# ---------- 命令行解析（重构版，支持灵活顺序） ----------
+# ---------- 命令行解析 ----------
 def print_help():
     help_text = f"""
 {colorize('TouchFish Version Manager (tfvm) v' + VERSION, 'CYAN')}
@@ -653,7 +723,6 @@ def parse_args():
                 logger.error(f"未知选项: {arg}")
                 sys.exit(1)
 
-    # 特殊情况处理
     if op == 'install' and clean_cache and not pkg_names:
         op = 'clean'
         clean_cache = False

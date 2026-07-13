@@ -80,6 +80,8 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 # ---------- 常量 ----------
+VERSION = "1.1.0"
+
 DEFAULT_CONFIG = {
     "registry": "https://reg.touchfish.us.ci/db.yml",      # 数据库 URL
     "sudo_at_start": False,
@@ -89,8 +91,6 @@ DEFAULT_CONFIG = {
     "db_file": "~/.tfvm/db.yml",                          # 本地数据库文件
     "installed_db": "~/.tfvm/installed.json"
 }
-
-VERSION = "1.1.0"
 
 # ---------- 辅助函数 ----------
 def expand_path(path: str) -> str:
@@ -123,7 +123,6 @@ class Config:
         if os.path.exists(self.config_path):
             with open(self.config_path, 'r') as f:
                 data = json.load(f)
-            # 补全缺失的默认键
             for key, value in DEFAULT_CONFIG.items():
                 if key not in data:
                     data[key] = value
@@ -178,11 +177,25 @@ class PackageDB:
             if not data:
                 raise ValueError("数据库为空")
             self.packages = data
-            self.save()
-            logger.info(colorize(f"数据库同步完成，共 {len(self.packages)} 个软件包", 'GREEN'))
         except Exception as e:
             logger.error(f"同步数据库失败: {e}")
             sys.exit(1)
+
+        # ---------- 确保 tfvm 自身包存在 ----------
+        if 'tfvm' not in self.packages:
+            self.packages['tfvm'] = {
+                'Name': 'tfvm',
+                'Comment': 'TouchFish Version Manager',
+                'Version': VERSION,
+                'Release': 1,
+                'Registry': 'https://github.com/touchfish-devs/tfvm/archive/refs/tags/v$version$.tar.gz',
+                'Exec': 'main.py',
+                'Binary': ['main.py']
+            }
+            logger.info(colorize("已添加默认 tfvm 包到数据库", 'YELLOW'))
+
+        self.save()
+        logger.info(colorize(f"数据库同步完成，共 {len(self.packages)} 个软件包", 'GREEN'))
 
     def get_pkg(self, name: str):
         return self.packages.get(name)
@@ -245,7 +258,6 @@ class TfvmManager:
         ensure_dir(self.cache_dir)
 
         self.install_root = self.config.get('install_root')
-        # 不在此创建，留给安装时用 sudo 创建
 
     def _check_sudo_requirement(self):
         if self.config.get('sudo_at_start', False):
@@ -262,7 +274,6 @@ class TfvmManager:
             desc = os.path.basename(dest)
             with open(dest, 'wb') as f:
                 if total_size == 0:
-                    # 无法获取大小，直接写入
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
@@ -331,7 +342,6 @@ class TfvmManager:
                 logger.error(f"复制文件到 {target_dir} 失败")
                 sys.exit(1)
 
-            # 设置 Binary 列表中文件的可执行权限
             binary_list = pkg_info.get('Binary', [])
             for rel_path in binary_list:
                 bin_file = os.path.join(target_dir, rel_path)
@@ -341,7 +351,6 @@ class TfvmManager:
                 if not run_sudo(['chmod', '+x', bin_file]):
                     logger.warning(f"设置可执行权限失败: {bin_file}")
 
-            # 创建符号链接
             exec_rel = pkg_info.get('Exec')
             if not exec_rel:
                 logger.warning(f"包 {pkg_name} 没有 Exec 字段，不创建符号链接")
@@ -560,31 +569,22 @@ Usage:
     print(help_text)
 
 def parse_args():
-    """
-    自定义解析器，支持：
-      - 短选项组合：-Syu, -Scc, -Sc, -Sy, -Su
-      - 混合顺序：-S -c pkg 或 -S pkg -c
-      - 启动模式：无选项直接跟包名
-    """
     raw = sys.argv[1:]
     if not raw:
         print_help()
         sys.exit(0)
 
-    # 将组合选项展开为单独选项
     expanded = []
     for arg in raw:
         if arg.startswith('--'):
             expanded.append(arg)
         elif arg.startswith('-') and len(arg) > 1:
-            # 拆分为单字符选项
             for ch in arg[1:]:
                 expanded.append('-' + ch)
         else:
             expanded.append(arg)
 
-    # 识别操作符和修饰符
-    op = None          # 'install', 'remove', 'query', 'upgrade', 'sync', 'clean', 'launch'
+    op = None
     pkg_names = []
     refresh = False
     clean_cache = False
@@ -601,16 +601,13 @@ def parse_args():
             help_flag = True
             break
         elif arg == '-S':
-            # 安装操作
             op = 'install'
             i += 1
-            # 收集后续所有非选项参数作为包名
             pkgs = []
             while i < len(expanded) and not expanded[i].startswith('-'):
                 pkgs.append(expanded[i])
                 i += 1
             pkg_names = pkgs
-            # 继续循环处理修饰符
             continue
         elif arg == '-R':
             op = 'remove'
@@ -639,34 +636,28 @@ def parse_args():
             i += 1
             continue
         elif arg == '-u':
-            # -u 不能单独出现，但可以与 -S 组合，此时应转为 upgrade
             if op == 'install':
                 op = 'upgrade'
             elif op is None:
-                # 单独的 -u 视为 upgrade 所有包
                 op = 'upgrade'
                 pkg_names = []
             i += 1
             continue
         else:
-            # 未识别的选项或包名
             if op is None and not arg.startswith('-'):
-                # 启动模式
                 op = 'launch'
                 pkg_names = [arg]
                 i += 1
-                # 后续参数将传递给启动的程序，不继续解析
                 break
             else:
                 logger.error(f"未知选项: {arg}")
                 sys.exit(1)
 
-    # 特殊处理：-Sc 无包名 → 清理缓存
+    # 特殊情况处理
     if op == 'install' and clean_cache and not pkg_names:
         op = 'clean'
-        clean_cache = False   # 避免重复清理
+        clean_cache = False
 
-    # -Sy 无包名 → 仅同步
     if op == 'install' and refresh and not pkg_names:
         op = 'sync'
 
@@ -677,7 +668,6 @@ def parse_args():
         print_help()
         sys.exit(0)
 
-    # 如果操作未设置但有包名，默认为启动
     if op is None and pkg_names:
         op = 'launch'
 
@@ -719,7 +709,6 @@ def main():
     elif op == 'sync':
         manager.sync_db()
     elif op == 'upgrade':
-        # upgrade 时，如果 refresh 为 True 则同步数据库
         manager.upgrade(pkg_names if pkg_names else None, refresh=refresh)
     elif op == 'clean':
         manager.clean_cache()

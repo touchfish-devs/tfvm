@@ -258,7 +258,7 @@ class TfvmManager:
         ensure_dir(self.cache_dir)
 
         self.install_root = self.config.get('install_root')
-        self.upgraded_tfvm = False  # 标记是否升级了自身
+        self.upgraded_tfvm = False
 
     def _check_sudo_requirement(self):
         if self.config.get('sudo_at_start', False):
@@ -298,7 +298,6 @@ class TfvmManager:
         base = os.path.basename(archive_path)
         ext = os.path.splitext(archive_path)[1].lower()
 
-        # AppImage 特殊处理
         if base.lower().endswith('.appimage'):
             shutil.copy2(archive_path, dest_dir)
             dest_file = os.path.join(dest_dir, os.path.basename(archive_path))
@@ -328,6 +327,14 @@ class TfvmManager:
             sys.exit(1)
 
     def _check_path_conflict(self, pkg_name: str):
+        """
+        检查路径冲突。
+        如果该包已由 tfvm 管理，则跳过检查（因为我们会先卸载再安装）。
+        """
+        # 若该包已安装，视为 tfvm 管理，不冲突
+        if self.installed.is_installed(pkg_name):
+            return 'none', ''
+
         import shutil
         existing_path = shutil.which(pkg_name)
         if existing_path is None:
@@ -397,7 +404,7 @@ class TfvmManager:
                     logger.info(f"已删除旧安装目录: {install_dir}")
                 self.installed.remove_pkg(pkg_name)
 
-        # 检查路径冲突
+        # 冲突检查（若已由 tfvm 管理则在 _check_path_conflict 中跳过）
         status, msg = self._check_path_conflict(pkg_name)
         if status == 'conflict':
             logger.error(f"包 {pkg_name}: {msg}")
@@ -543,7 +550,7 @@ class TfvmManager:
             logger.info("没有需要处理的新包或更新包")
             return
 
-        # 冲突检查汇总
+        # 冲突检查汇总（已安装的包自动跳过）
         conflicts = []
         warnings = []
         for pkg in all_pkgs:
@@ -823,7 +830,6 @@ def main():
         logger.error(f"未知操作: {op}")
         sys.exit(1)
 
-    # 如果升级了 tfvm 自身，提示用户重新运行
     if manager.upgraded_tfvm:
         logger.info(colorize("tfvm 已升级到最新版本，请重新运行命令以应用更新。", 'YELLOW'))
 

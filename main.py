@@ -80,7 +80,7 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 # ---------- 常量 ----------
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 DEFAULT_CONFIG = {
     "registry": "https://reg.touchfish.us.ci/db.yml",
@@ -292,43 +292,65 @@ class TfvmManager:
             logger.error(f"下载失败: {e}")
             sys.exit(1)
 
-    def _extract_tar_gz(self, tarball: str, dest_dir: str):
-        logger.info(f"解压: {tarball} -> {dest_dir}")
-        with tarfile.open(tarball, 'r:gz') as tar:
-            tar.extractall(dest_dir)
+    def _extract_archive(self, archive_path: str, dest_dir: str):
+        """解压各种归档格式"""
+        logger.info(f"解压: {archive_path} -> {dest_dir}")
+        base = os.path.basename(archive_path)
+        ext = os.path.splitext(archive_path)[1].lower()
+
+        # AppImage 特殊处理（单一可执行文件）
+        if base.lower().endswith('.appimage'):
+            shutil.copy2(archive_path, dest_dir)
+            dest_file = os.path.join(dest_dir, os.path.basename(archive_path))
+            os.chmod(dest_file, 0o755)
+            return
+
+        # 其他归档
+        try:
+            if ext in ('.gz', '.tgz') and archive_path.endswith(('.tar.gz', '.tgz')):
+                subprocess.run(['tar', '-xzf', archive_path, '-C', dest_dir], check=True)
+            elif ext in ('.xz', '.txz') and archive_path.endswith(('.tar.xz', '.txz')):
+                subprocess.run(['tar', '-xJf', archive_path, '-C', dest_dir], check=True)
+            elif ext == '.zst':
+                if archive_path.endswith('.tar.zst'):
+                    subprocess.run(['tar', '--zstd', '-xf', archive_path, '-C', dest_dir], check=True)
+                else:
+                    # 纯 .zst 文件
+                    out_name = os.path.basename(archive_path)[:-4]
+                    subprocess.run(['zstd', '-d', archive_path, '-o', os.path.join(dest_dir, out_name)], check=True)
+            elif ext == '.zip':
+                subprocess.run(['unzip', '-q', archive_path, '-d', dest_dir], check=True)
+            else:
+                # 未知格式，尝试 tar 自动检测
+                subprocess.run(['tar', '-xf', archive_path, '-C', dest_dir], check=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"解压失败: {e}")
+            sys.exit(1)
+        except FileNotFoundError as e:
+            logger.error(f"缺少必要的解压工具: {e}")
+            sys.exit(1)
 
     def _check_path_conflict(self, pkg_name: str):
-        """
-        检查系统中是否存在同名的可执行文件，并判断其与 /usr/local/bin 的优先级关系。
-        返回 (status, message)
-        status: 'none', 'conflict', 'occupied_ahead', 'occupied_behind'
-        """
+        """检查系统路径冲突，返回 (status, message)"""
         import shutil
-        # 查找当前 PATH 中的第一个匹配
         existing_path = shutil.which(pkg_name)
         if existing_path is None:
             return 'none', ''
 
         target_path = os.path.join(self.bin_dir, pkg_name)
-        # 如果已存在且路径就是我们的目标位置，则冲突
         if existing_path == target_path:
             return 'conflict', f"路径 {target_path} 已被占用，可能是系统包或手动安装，与 tfvm 安装位置冲突。"
 
-        # 获取 PATH 列表
         path_list = os.environ.get('PATH', '').split(os.pathsep)
-        # 找到 /usr/local/bin 的索引
         try:
             local_idx = path_list.index(self.bin_dir)
         except ValueError:
-            # /usr/local/bin 不在 PATH 中，不会影响
             return 'none', ''
 
-        # 找到外部路径所在目录的索引
         dirname = os.path.dirname(existing_path)
         try:
             ext_idx = path_list.index(dirname)
         except ValueError:
-            # 理论上不会发生，因为 which 能找到它
             return 'none', ''
 
         if ext_idx < local_idx:
@@ -336,22 +358,63 @@ class TfvmManager:
         elif ext_idx > local_idx:
             return 'occupied_behind', f"外部包 {existing_path} 在 PATH 中位于 {self.bin_dir} 之后，tfvm 将覆盖该命令，建议卸载外部包。"
         else:
-            # 不会发生
             return 'none', ''
 
+    def _resolve_dependencies(self, pkg_name: str, pkg_info: dict, visited: set):
+        """
+        递归解析所有依赖（包括间接依赖），返回依赖列表（不包含自身），
+        顺序保证依赖在前（深度优先）。
+        """
+        if pkg_name in visited:
+            return []
+        visited.add(pkg_name)
+
+        deps = pkg_info.get('Depends', [])
+        result = []
+        for dep in deps:
+            dep_info = self.db.get_pkg(dep)
+            if not dep_info:
+                logger.error(f"依赖包 {dep} 不存在于数据库中")
+                sys.exit(1)
+            # 递归收集子依赖
+            sub = self._resolve_dependencies(dep, dep_info, visited)
+            result.extend(sub)
+            result.append(dep)  # 在子依赖之后添加自身
+        return result
+
     def _install_pkg(self, pkg_name: str, pkg_info: dict):
+        """
+        安装或升级单个包：
+        - 若未安装，则安装最新版本。
+        - 若已安装且版本相同，则跳过。
+        - 若已安装但版本不同，则先卸载旧版本，再安装新版本。
+        """
+        # 检查是否已安装
         if self.installed.is_installed(pkg_name):
-            logger.info(f"包 {pkg_name} 已安装，跳过")
-            return
+            current_version = self.installed.get_installed_version(pkg_name)
+            new_version = pkg_info.get('Version')
+            if current_version == new_version:
+                logger.info(f"包 {pkg_name} 已是最新版本 {current_version}")
+                return
+            else:
+                logger.info(f"升级包 {pkg_name}: {current_version} -> {new_version}")
+                # 卸载旧版本
+                info = self.installed.data.get(pkg_name, {})
+                symlink = info.get('symlink')
+                install_dir = info.get('install_dir')
+                if symlink and os.path.islink(symlink):
+                    if not run_sudo(['rm', '-f', symlink]):
+                        logger.error(f"删除旧符号链接失败: {symlink}")
+                        sys.exit(1)
+                    logger.info(f"已删除旧符号链接: {symlink}")
+                if install_dir and os.path.exists(install_dir):
+                    if not run_sudo(['rm', '-rf', install_dir]):
+                        logger.error(f"删除旧安装目录失败: {install_dir}")
+                        sys.exit(1)
+                    logger.info(f"已删除旧安装目录: {install_dir}")
+                self.installed.remove_pkg(pkg_name)
 
-        # 冲突检查（在下载前进行）
-        status, msg = self._check_path_conflict(pkg_name)
-        if status == 'conflict':
-            logger.error(f"包 {pkg_name}: {msg}")
-            sys.exit(1)
-        elif status in ('occupied_ahead', 'occupied_behind'):
-            logger.warning(f"包 {pkg_name}: {msg}")
-
+        # 安装新版本
         version = pkg_info.get('Version')
         if not version:
             logger.error(f"包 {pkg_name} 没有 Version 字段")
@@ -362,13 +425,59 @@ class TfvmManager:
             sys.exit(1)
         download_url = registry_template.replace('$version$', version)
 
-        tarball_name = f"{pkg_name}-{version}.tar.gz"
-        cache_path = os.path.join(self.cache_dir, tarball_name)
+        # 下载
+        url_filename = os.path.basename(download_url.split('?')[0])
+        cache_path = os.path.join(self.cache_dir, url_filename)
         if not os.path.exists(cache_path):
             self._download_file(download_url, cache_path)
+        else:
+            logger.info(f"使用缓存: {cache_path}")
 
+        # 创建临时目录用于解压（除非是 AppImage）
         with tempfile.TemporaryDirectory(prefix='tfvm_') as tmpdir:
-            self._extract_tar_gz(cache_path, tmpdir)
+            is_appimage = cache_path.lower().endswith('.appimage')
+            if is_appimage:
+                # AppImage 直接复制
+                target_dir = os.path.join(self.install_root, pkg_name)
+                if os.path.exists(target_dir):
+                    if not run_sudo(['rm', '-rf', target_dir]):
+                        logger.error(f"删除旧目录失败: {target_dir}")
+                        sys.exit(1)
+                if not run_sudo(['mkdir', '-p', self.install_root]):
+                    logger.error(f"无法创建安装根目录: {self.install_root}")
+                    sys.exit(1)
+                if not run_sudo(['mkdir', '-p', target_dir]):
+                    logger.error(f"无法创建目标目录: {target_dir}")
+                    sys.exit(1)
+                dest_file = os.path.join(target_dir, os.path.basename(cache_path))
+                if not run_sudo(['cp', cache_path, dest_file]):
+                    logger.error(f"复制 AppImage 失败")
+                    sys.exit(1)
+                if not run_sudo(['chmod', '+x', dest_file]):
+                    logger.warning(f"设置可执行权限失败: {dest_file}")
+
+                # 创建符号链接
+                exec_target = pkg_info.get('Exec')
+                if exec_target:
+                    exec_target = os.path.join(target_dir, exec_target)
+                else:
+                    exec_target = dest_file
+                symlink_path = os.path.join(self.bin_dir, pkg_name)
+                if os.path.islink(symlink_path) or os.path.exists(symlink_path):
+                    if not run_sudo(['rm', '-f', symlink_path]):
+                        logger.error(f"无法删除旧符号链接: {symlink_path}")
+                        sys.exit(1)
+                if not run_sudo(['ln', '-sf', exec_target, symlink_path]):
+                    logger.error(f"创建符号链接失败: {symlink_path} -> {exec_target}")
+                    sys.exit(1)
+                logger.info(f"已创建符号链接: {symlink_path}")
+
+                self.installed.add_pkg(pkg_name, version, target_dir, symlink_path)
+                logger.info(colorize(f"包 {pkg_name} 安装完成", 'GREEN'))
+                return
+
+            # 普通归档：解压到临时目录
+            self._extract_archive(cache_path, tmpdir)
             extracted_root = tmpdir
             items = os.listdir(tmpdir)
             if len(items) == 1 and os.path.isdir(os.path.join(tmpdir, items[0])):
@@ -376,12 +485,10 @@ class TfvmManager:
 
             target_dir = os.path.join(self.install_root, pkg_name)
             if os.path.exists(target_dir):
-                logger.info(f"删除旧的安装目录: {target_dir}")
                 if not run_sudo(['rm', '-rf', target_dir]):
                     logger.error(f"删除旧目录失败: {target_dir}")
                     sys.exit(1)
 
-            logger.info(f"安装包到: {target_dir}")
             if not run_sudo(['mkdir', '-p', self.install_root]):
                 logger.error(f"无法创建安装根目录: {self.install_root}")
                 sys.exit(1)
@@ -392,6 +499,7 @@ class TfvmManager:
                 logger.error(f"复制文件到 {target_dir} 失败")
                 sys.exit(1)
 
+            # 设置 Binary 列表中文件的可执行权限
             binary_list = pkg_info.get('Binary', [])
             for rel_path in binary_list:
                 bin_file = os.path.join(target_dir, rel_path)
@@ -401,6 +509,7 @@ class TfvmManager:
                 if not run_sudo(['chmod', '+x', bin_file]):
                     logger.warning(f"设置可执行权限失败: {bin_file}")
 
+            # 创建符号链接
             exec_rel = pkg_info.get('Exec')
             if not exec_rel:
                 logger.warning(f"包 {pkg_name} 没有 Exec 字段，不创建符号链接")
@@ -423,52 +532,41 @@ class TfvmManager:
             self.installed.add_pkg(pkg_name, version, target_dir, symlink_path)
             logger.info(colorize(f"包 {pkg_name} 安装完成", 'GREEN'))
 
-    def _resolve_dependencies(self, pkg_name: str, pkg_info: dict, visited: set):
-        if pkg_name in visited:
-            return []
-        visited.add(pkg_name)
-
-        deps = pkg_info.get('Depends', [])
-        install_list = []
-        for dep in deps:
-            if self.installed.is_installed(dep):
-                continue
-            dep_info = self.db.get_pkg(dep)
-            if not dep_info:
-                logger.error(f"依赖包 {dep} 不存在于数据库中")
-                sys.exit(1)
-            sub_deps = self._resolve_dependencies(dep, dep_info, visited)
-            install_list.extend(sub_deps)
-            install_list.append(dep)
-        return install_list
-
-    def install(self, pkg_names: list, clean_cache: bool = False):
+    def install(self, pkg_names: list, clean_cache: bool = False, refresh: bool = False):
+        """
+        安装或升级指定包及其所有依赖（确保依赖最新）。
+        若 refresh 为 True，则先同步数据库。
+        """
         self._check_sudo_requirement()
-        self.db.sync()
+        if refresh:
+            self.db.sync()
 
         if clean_cache:
             self.clean_cache()
 
-        all_pkgs = set()
+        # 收集所有要处理的包（主包 + 所有依赖），并保证依赖在前
+        all_pkgs = []
         visited = set()
         for name in pkg_names:
             pkg_info = self.db.get_pkg(name)
             if not pkg_info:
                 logger.error(f"包 {name} 不存在于数据库")
                 sys.exit(1)
+            # 获取依赖列表（已按顺序）
             deps = self._resolve_dependencies(name, pkg_info, visited)
-            all_pkgs.update(deps)
-            all_pkgs.add(name)
+            all_pkgs.extend(deps)
+            all_pkgs.append(name)  # 主包放在依赖之后
+        # 去重并保持顺序
+        all_pkgs = list(dict.fromkeys(all_pkgs))
 
-        to_install = [p for p in all_pkgs if not self.installed.is_installed(p)]
-        if not to_install:
-            logger.info("所有包已安装")
+        if not all_pkgs:
+            logger.info("没有需要处理的新包或更新包")
             return
 
-        # ---------- 冲突检查 ----------
+        # 冲突检查
         conflicts = []
         warnings = []
-        for pkg in to_install:
+        for pkg in all_pkgs:
             status, msg = self._check_path_conflict(pkg)
             if status == 'conflict':
                 conflicts.append((pkg, msg))
@@ -485,27 +583,33 @@ class TfvmManager:
             for pkg, msg in warnings:
                 logger.warning(f"  {pkg}: {msg}")
 
-        logger.info(f"将安装以下包: {', '.join(to_install)}")
-        confirm = input(colorize("确认安装吗？(Y/n): ", 'YELLOW')).strip().lower()
+        logger.info(f"将处理以下包: {', '.join(all_pkgs)}")
+        confirm = input(colorize("确认继续吗？(Y/n): ", 'YELLOW')).strip().lower()
         if confirm and confirm != 'y':
-            logger.info("安装取消")
+            logger.info("操作取消")
             return
 
-        installed_set = set()
-        for pkg in to_install:
-            if pkg in installed_set:
-                continue
+        # 按顺序安装/升级每个包
+        for pkg in all_pkgs:
             pkg_info = self.db.get_pkg(pkg)
             if not pkg_info:
                 logger.error(f"包 {pkg} 不存在")
                 continue
-            deps = pkg_info.get('Depends', [])
-            for dep in deps:
-                if not self.installed.is_installed(dep) and dep not in installed_set:
-                    self._install_pkg(dep, self.db.get_pkg(dep))
-                    installed_set.add(dep)
             self._install_pkg(pkg, pkg_info)
-            installed_set.add(pkg)
+
+    def upgrade(self, pkg_names=None, refresh=False):
+        """
+        升级已安装的包（若未指定包名，则升级所有已安装包）。
+        复用 install 逻辑，确保依赖也更新。
+        """
+        if pkg_names is None:
+            installed = self.installed.get_all()
+            pkg_names = list(installed.keys())
+            if not pkg_names:
+                logger.info("没有已安装的包")
+                return
+        # 调用 install，它会同步数据库（如果需要）并处理依赖
+        self.install(pkg_names, clean_cache=False, refresh=refresh)
 
     def remove(self, pkg_names: list):
         self._check_sudo_requirement()
@@ -557,46 +661,6 @@ class TfvmManager:
     def sync_db(self):
         self.db.sync()
 
-    def upgrade(self, pkg_names=None, refresh=False):
-        self._check_sudo_requirement()
-        if refresh:
-            self.db.sync()
-        else:
-            self.db.load()
-
-        if pkg_names:
-            for name in pkg_names:
-                if not self.installed.is_installed(name):
-                    logger.warning(f"包 {name} 未安装，跳过")
-                    continue
-                pkg_info = self.db.get_pkg(name)
-                if not pkg_info:
-                    logger.error(f"包 {name} 不存在于数据库")
-                    sys.exit(1)
-                current_version = self.installed.get_installed_version(name)
-                new_version = pkg_info.get('Version')
-                if current_version == new_version:
-                    logger.info(f"包 {name} 已是最新版本 {current_version}")
-                else:
-                    logger.info(f"升级包 {name}: {current_version} -> {new_version}")
-                    self.remove([name])
-                    self.install([name])
-        else:
-            installed = self.installed.get_all()
-            for name in installed:
-                pkg_info = self.db.get_pkg(name)
-                if not pkg_info:
-                    logger.warning(f"包 {name} 在数据库中不存在，可能已废弃")
-                    continue
-                current_version = installed[name].get('version')
-                new_version = pkg_info.get('Version')
-                if current_version == new_version:
-                    logger.info(f"包 {name} 已是最新版本")
-                else:
-                    logger.info(f"升级包 {name}: {current_version} -> {new_version}")
-                    self.remove([name])
-                    self.install([name])
-
     def clean_cache(self):
         cache_dir = self.cache_dir
         if os.path.exists(cache_dir):
@@ -620,13 +684,13 @@ def print_help():
 {colorize('TouchFish Version Manager (tfvm) v' + VERSION, 'CYAN')}
 Usage:
   tfvm <pkg>               启动已安装的包（相当于执行 /usr/local/bin/<pkg>）
-  tfvm -S <pkg> [pkg...]   安装一个或多个包（自动处理依赖）
+  tfvm -S <pkg> [pkg...]   安装或升级指定包及其依赖（自动更新依赖）
   tfvm -R <pkg> [pkg...]   卸载一个或多个包
   tfvm -Q [pkg]            查询包信息（不指定则列出所有）
   tfvm -Sy                 同步数据库（不安装）
-  tfvm -Su [pkg...]        升级指定包（不指定则升级所有已安装包）
+  tfvm -Su [pkg...]        升级指定包（不指定则升级所有已安装包），同时更新依赖
   tfvm -Sc                 清理下载缓存
-  tfvm -Syu                同步数据库并升级所有包（等价于 -Sy -Su）
+  tfvm -Syu                同步数据库并升级所有包
   tfvm -Scc                清理缓存（等效于 -Sc）
   tfvm -v                  显示版本号
   tfvm -h                  显示此帮助
@@ -762,9 +826,7 @@ def main():
     manager = TfvmManager()
 
     if op == 'install':
-        if refresh:
-            manager.sync_db()
-        manager.install(pkg_names, clean_cache=clean_cache)
+        manager.install(pkg_names, clean_cache=clean_cache, refresh=refresh)
     elif op == 'remove':
         if not pkg_names:
             logger.error("未指定要卸载的包")
@@ -778,6 +840,7 @@ def main():
     elif op == 'sync':
         manager.sync_db()
     elif op == 'upgrade':
+        # 若 refresh 为 True，已在参数中，传递给 upgrade
         manager.upgrade(pkg_names if pkg_names else None, refresh=refresh)
     elif op == 'clean':
         manager.clean_cache()

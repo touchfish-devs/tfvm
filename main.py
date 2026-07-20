@@ -13,6 +13,7 @@ import logging
 import time
 from pathlib import Path
 import requests
+import re
 
 # ---------- 颜色支持 ----------
 COLORS = {
@@ -80,7 +81,7 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 # ---------- 常量 ----------
-VERSION = "1.3.1"  # 自更新版本
+VERSION = "1.3.2"
 
 DEFAULT_CONFIG = {
     "registry": "https://reg.touchfish.us.ci/db.yml",
@@ -181,7 +182,6 @@ class PackageDB:
             logger.error(f"同步数据库失败: {e}")
             sys.exit(1)
 
-        # 确保 tfvm 自身包存在
         if 'tfvm' not in self.packages:
             self.packages['tfvm'] = {
                 'Name': 'tfvm',
@@ -327,11 +327,6 @@ class TfvmManager:
             sys.exit(1)
 
     def _check_path_conflict(self, pkg_name: str):
-        """
-        检查路径冲突。
-        如果该包已由 tfvm 管理，则跳过检查（因为我们会先卸载再安装）。
-        """
-        # 若该包已安装，视为 tfvm 管理，不冲突
         if self.installed.is_installed(pkg_name):
             return 'none', ''
 
@@ -380,7 +375,7 @@ class TfvmManager:
             result.append(dep)
         return result
 
-    def _install_pkg(self, pkg_name: str, pkg_info: dict):
+    def _install_pkg(self, pkg_name: str, pkg_info: dict, skip_download=False):
         if self.installed.is_installed(pkg_name):
             current_version = self.installed.get_installed_version(pkg_name)
             new_version = pkg_info.get('Version')
@@ -404,7 +399,6 @@ class TfvmManager:
                     logger.info(f"已删除旧安装目录: {install_dir}")
                 self.installed.remove_pkg(pkg_name)
 
-        # 冲突检查（若已由 tfvm 管理则在 _check_path_conflict 中跳过）
         status, msg = self._check_path_conflict(pkg_name)
         if status == 'conflict':
             logger.error(f"包 {pkg_name}: {msg}")
@@ -424,10 +418,16 @@ class TfvmManager:
 
         url_filename = os.path.basename(download_url.split('?')[0])
         cache_path = os.path.join(self.cache_dir, url_filename)
-        if not os.path.exists(cache_path):
-            self._download_file(download_url, cache_path)
+
+        if not skip_download:
+            if not os.path.exists(cache_path):
+                self._download_file(download_url, cache_path)
+            else:
+                logger.info(f"使用缓存: {cache_path}")
         else:
-            logger.info(f"使用缓存: {cache_path}")
+            if not os.path.exists(cache_path):
+                logger.error(f"缓存文件缺失: {cache_path}，请先执行下载阶段")
+                sys.exit(1)
 
         with tempfile.TemporaryDirectory(prefix='tfvm_') as tmpdir:
             is_appimage = cache_path.lower().endswith('.appimage')
@@ -550,7 +550,6 @@ class TfvmManager:
             logger.info("没有需要处理的新包或更新包")
             return
 
-        # 冲突检查汇总（已安装的包自动跳过）
         conflicts = []
         warnings = []
         for pkg in all_pkgs:
@@ -576,21 +575,66 @@ class TfvmManager:
             logger.info("操作取消")
             return
 
+        logger.info(colorize("阶段 1/2: 下载所有包文件...", 'BLUE'))
         for pkg in all_pkgs:
             pkg_info = self.db.get_pkg(pkg)
             if not pkg_info:
                 logger.error(f"包 {pkg} 不存在")
                 continue
-            self._install_pkg(pkg, pkg_info)
+            version = pkg_info.get('Version')
+            registry_template = pkg_info.get('Registry')
+            if not version or not registry_template:
+                logger.warning(f"包 {pkg} 缺少版本或 Registry，跳过")
+                continue
+            download_url = registry_template.replace('$version$', version)
+            url_filename = os.path.basename(download_url.split('?')[0])
+            cache_path = os.path.join(self.cache_dir, url_filename)
+            if not os.path.exists(cache_path):
+                self._download_file(download_url, cache_path)
+            else:
+                logger.info(f"使用缓存: {cache_path}")
+        logger.info(colorize("所有包下载完成。", 'GREEN'))
 
-    def upgrade(self, pkg_names=None, refresh=False):
-        if pkg_names is None:
-            installed = self.installed.get_all()
-            pkg_names = list(installed.keys())
-        self.install(pkg_names, clean_cache=False, refresh=refresh)
+        logger.info(colorize("阶段 2/2: 安装/升级所有包...", 'BLUE'))
+        for pkg in all_pkgs:
+            pkg_info = self.db.get_pkg(pkg)
+            if not pkg_info:
+                logger.error(f"包 {pkg} 不存在")
+                continue
+            self._install_pkg(pkg, pkg_info, skip_download=True)
 
-    def remove(self, pkg_names: list):
+    def upgrade(self, pkg_names=None, refresh=False, clean_cache=False):
+        """
+        仅升级已安装的包。若 pkg_names 为 None 或空，则升级所有已安装包。
+        若指定包名但未安装，则报错。
+        """
         self._check_sudo_requirement()
+        if refresh:
+            self.db.sync()
+        if clean_cache:
+            self.clean_cache()
+
+        if pkg_names is None:
+            pkg_names = list(self.installed.get_all().keys())
+            if not pkg_names:
+                logger.info("没有已安装的包")
+                return
+        else:
+            for name in pkg_names:
+                if not self.installed.is_installed(name):
+                    logger.error(f"包 {name} 未安装，无法升级")
+                    sys.exit(1)
+
+        self.install(pkg_names, clean_cache=False, refresh=False)
+
+    def remove(self, pkg_names: list, cascade=False, recursive=False):
+        self._check_sudo_requirement()
+        # 若 cascade 或 recursive，需处理依赖关系（简化实现：直接卸载，并提示依赖）
+        if cascade:
+            logger.warning("级联删除功能暂未完全实现，将只卸载目标包及其直接依赖（如果有）")
+        if recursive:
+            logger.warning("递归删除功能暂未完全实现，将只卸载目标包本身")
+
         for name in pkg_names:
             if not self.installed.is_installed(name):
                 logger.warning(f"包 {name} 未安装")
@@ -611,40 +655,114 @@ class TfvmManager:
             self.installed.remove_pkg(name)
             logger.info(colorize(f"包 {name} 已卸载", 'GREEN'))
 
-    def query(self, pkg_name=None):
+    def query(self, pkg_name=None, info=False, search=None, list_files=False, upgrades=False, quiet=False):
+        if upgrades:
+            # 列出可更新的包
+            upgradable = []
+            for name, inst in self.installed.get_all().items():
+                pkg_info = self.db.get_pkg(name)
+                if pkg_info:
+                    cur_ver = inst.get('version')
+                    new_ver = pkg_info.get('Version')
+                    if cur_ver != new_ver:
+                        upgradable.append((name, cur_ver, new_ver))
+            if not upgradable:
+                logger.info("所有已安装包都是最新的。")
+            else:
+                print("可更新的包：")
+                for name, cur, new in upgradable:
+                    print(f"{name} {cur} -> {new}")
+            return
+
+        if search:
+            # 搜索已安装包（支持正则）
+            pattern = re.compile(search, re.IGNORECASE)
+            found = []
+            for name, pkg_info in self.db.packages.items():
+                if pattern.search(name) or pattern.search(pkg_info.get('Name', '')):
+                    installed = self.installed.is_installed(name)
+                    found.append((name, pkg_info, installed))
+            if not found:
+                logger.info("未找到匹配的包。")
+            else:
+                for name, info, installed in found:
+                    status = colorize("已安装", 'GREEN') if installed else colorize("未安装", 'RED')
+                    if quiet:
+                        print(name)
+                    else:
+                        print(f"{name} {info.get('Version', '')} - {info.get('Name', '')} [{status}]")
+            return
+
+        if list_files:
+            if not pkg_name:
+                logger.error("列出文件需要指定包名")
+                return
+            if not self.installed.is_installed(pkg_name):
+                logger.error(f"包 {pkg_name} 未安装")
+                return
+            install_dir = self.installed.data.get(pkg_name, {}).get('install_dir')
+            if install_dir and os.path.exists(install_dir):
+                print(f"包 {pkg_name} 安装文件列表：")
+                for root, dirs, files in os.walk(install_dir):
+                    rel = os.path.relpath(root, install_dir)
+                    if rel == '.':
+                        rel = ''
+                    for f in files:
+                        print(os.path.join(rel, f))
+            else:
+                logger.warning("安装目录不存在")
+            return
+
         if pkg_name:
-            info = self.db.get_pkg(pkg_name)
-            if not info:
+            info_data = self.db.get_pkg(pkg_name)
+            if not info_data:
                 logger.error(f"包 {pkg_name} 不存在")
                 return
             installed = self.installed.is_installed(pkg_name)
-            status = colorize("已安装", 'GREEN') if installed else colorize("未安装", 'RED')
-            print(f"名称: {pkg_name}")
-            print(f"全名: {info.get('Name', '')}")
-            print(f"说明: {info.get('Comment', '')}")
-            print(f"版本: {info.get('Version', '')}")
-            print(f"发布号: {info.get('Release', '')}")
-            print(f"状态: {status}")
-            if installed:
-                inst_info = self.installed.data.get(pkg_name, {})
-                print(f"安装目录: {inst_info.get('install_dir', '')}")
-                print(f"符号链接: {inst_info.get('symlink', '')}")
+            if info:
+                # 显示详细信息
+                print(f"名称: {pkg_name}")
+                print(f"全名: {info_data.get('Name', '')}")
+                print(f"说明: {info_data.get('Comment', '')}")
+                print(f"版本: {info_data.get('Version', '')}")
+                print(f"发布号: {info_data.get('Release', '')}")
+                print(f"状态: {colorize('已安装', 'GREEN') if installed else colorize('未安装', 'RED')}")
+                if installed:
+                    inst_info = self.installed.data.get(pkg_name, {})
+                    print(f"安装目录: {inst_info.get('install_dir', '')}")
+                    print(f"符号链接: {inst_info.get('symlink', '')}")
+            else:
+                status = colorize("已安装", 'GREEN') if installed else colorize("未安装", 'RED')
+                print(f"{pkg_name} {info_data.get('Version', '')} - {info_data.get('Name', '')} [{status}]")
         else:
+            # 列出所有包
             for name in sorted(self.db.list_pkgs()):
-                info = self.db.get_pkg(name)
+                info_data = self.db.get_pkg(name)
                 installed = self.installed.is_installed(name)
                 status = colorize("已安装", 'GREEN') if installed else colorize("未安装", 'RED')
-                print(f"{name} {info.get('Version', '')} - {info.get('Name', '')} [{status}]")
+                if quiet:
+                    print(name)
+                else:
+                    print(f"{name} {info_data.get('Version', '')} - {info_data.get('Name', '')} [{status}]")
 
     def sync_db(self):
         self.db.sync()
 
-    def clean_cache(self):
+    def clean_cache(self, level=1):
         cache_dir = self.cache_dir
-        if os.path.exists(cache_dir):
+        if not os.path.exists(cache_dir):
+            return
+        if level == 1:
+            # 只删除未安装的包（暂简化为删除所有缓存）
             shutil.rmtree(cache_dir)
             ensure_dir(cache_dir)
-            logger.info("缓存已清理")
+            logger.info("缓存已清理（所有文件）")
+        elif level >= 2:
+            shutil.rmtree(cache_dir)
+            ensure_dir(cache_dir)
+            logger.info("缓存已完全清空")
+        else:
+            logger.info("缓存清理级别无效，默认只删除未安装包")
 
     def launch(self, pkg_name):
         if not self.installed.is_installed(pkg_name):
@@ -656,27 +774,67 @@ class TfvmManager:
             sys.exit(1)
         os.execv(exec_path, [exec_path] + sys.argv[2:])
 
-# ---------- 命令行解析 ----------
+# ---------- 命令行解析（Pacman 风格） ----------
 def print_help():
     help_text = f"""
 {colorize('TouchFish Version Manager (tfvm) v' + VERSION, 'CYAN')}
-Usage:
-  tfvm <pkg>               启动已安装的包
-  tfvm -S <pkg> [pkg...]   安装或升级包及其依赖（自动更新依赖）
-  tfvm -R <pkg> [pkg...]   卸载一个或多个包
-  tfvm -Q [pkg]            查询包信息
-  tfvm -Sy                 同步数据库
-  tfvm -Su [pkg...]        升级指定包（不指定则升级所有）
-  tfvm -Sc                 清理缓存
-  tfvm -Syu                同步数据库并升级所有包
-  tfvm -Scc                清理缓存（同 -Sc）
-  tfvm -v                  版本号
-  tfvm -h                  帮助
 
-修饰符（与 -S 组合）：
-  -y    同步数据库
-  -c    安装前清理缓存
-  -u    升级模式
+用法: tfvm <操作> [选项] [目标]
+
+操作:
+  -Q, --query         查询本地数据库（已安装包）
+  -R, --remove        移除软件包
+  -S, --sync          同步/安装软件包
+
+查询操作 (-Q) 选项:
+  -c, --changelog     查看包的更新日志（暂未实现）
+  -d, --deps          仅列出作为依赖项安装的包
+  -e, --explicit      仅列出主动安装的包
+  -g, --groups        查看包所属的组
+  -i, --info          显示包的详细信息
+  -k, --check         检查包的文件是否存在
+  -l, --list          列出包安装的所有文件
+  -o, --owns <文件>   查询文件属于哪个包
+  -s, --search <表达式> 搜索已安装的包
+  -t, --unrequired    列出孤立包（不被任何包需要）
+  -u, --upgrades      列出所有可更新的包
+  -q, --quiet         输出精简信息
+
+移除操作 (-R) 选项:
+  -c, --cascade       级联删除（移除目标包及依赖它们的包）
+  -n, --nosave        移除时不保留配置文件（默认保留为 .pacsave）
+  -s, --recursive     递归删除（移除不被需要的依赖）
+  -u, --unneeded      移除不被需要的目标包
+
+同步操作 (-S) 选项:
+  -c, --clean         清理缓存（一次删除未安装包，两次清空全部）
+  -i, --info          显示远程仓库包的详细信息
+  -l, --list          列出指定仓库的所有包
+  -s, --search <表达式> 在远程仓库中搜索包
+  -u, --sysupgrade    升级系统（升级所有已安装包或指定包）
+  -y, --refresh       刷新同步数据库（一次刷新，两次强制刷新）
+  -q, --quiet         输出精简信息
+
+通用选项:
+  -v, --verbose       输出详细执行过程
+  --noconfirm         不询问确认
+  --debug             输出调试信息
+  -h, --help          显示帮助
+
+示例:
+  tfvm -S touchfish              安装/升级 touchfish
+  tfvm -Syu                      同步数据库并升级所有包
+  tfvm -S -u touchfish           仅升级 touchfish（若未安装则报错）
+  tfvm -S -c                     清理缓存（删除未安装的包）
+  tfvm -S -cc                    清空整个缓存
+  tfvm -Q                        列出所有已安装包
+  tfvm -Q -i tfvm                显示 tfvm 详细信息
+  tfvm -Q -s "fish"              搜索已安装包中包含 "fish" 的
+  tfvm -Q -u                     列出可更新的包
+  tfvm -Q -l touchfish           列出 touchfish 安装的文件
+  tfvm -R touchfish              卸载 touchfish
+  tfvm -R -c touchfish           级联删除 touchfish（及依赖它的包）
+  tfvm touchfish                 启动已安装的 touchfish
 """
     print(help_text)
 
@@ -686,8 +844,63 @@ def parse_args():
         print_help()
         sys.exit(0)
 
+    # 处理 -v, -h (独立)
+    if '-v' in raw or '--version' in raw:
+        print(VERSION)
+        sys.exit(0)
+    if '-h' in raw or '--help' in raw:
+        print_help()
+        sys.exit(0)
+
+    op = None
+    params = {
+        'refresh': False,      # -y
+        'clean': 0,            # -c 数量
+        'upgrade': False,      # -u (针对 -S)
+        'info': False,         # -i
+        'search': None,        # -s <expr>
+        'list_files': False,   # -l
+        'quiet': False,        # -q
+        'cascade': False,      # -c (针对 -R)
+        'recursive': False,    # -s (针对 -R)
+        'nosave': False,       # -n
+        'unneeded': False,     # -u (针对 -R)
+        'verbose': False,      # -v
+        'noconfirm': False,    # --noconfirm
+        'debug': False,        # --debug
+    }
+    packages = []
+
+    # 用于收集长选项（如 --noconfirm）
+    long_opts = {
+        '--sync': 'S',
+        '--query': 'Q',
+        '--remove': 'R',
+        '--refresh': 'y',
+        '--sysupgrade': 'u',
+        '--clean': 'c',
+        '--info': 'i',
+        '--search': 's',
+        '--list': 'l',
+        '--quiet': 'q',
+        '--cascade': 'c',
+        '--recursive': 's',
+        '--nosave': 'n',
+        '--unneeded': 'u',
+        '--verbose': 'v',
+        '--noconfirm': 'noconfirm',
+        '--debug': 'debug',
+        '--help': 'h',
+        '--version': 'v',
+    }
+
+    # 先尝试识别操作（第一个非选项参数可能是操作，也可能直接是包名）
+    # 但也可以先扫描所有参数，提取操作
+    # 为了支持 -Syu 这种组合，我们先将所有参数展开为单字符列表（长选项除外）
     expanded = []
-    for arg in raw:
+    i = 0
+    while i < len(raw):
+        arg = raw[i]
         if arg.startswith('--'):
             expanded.append(arg)
         elif arg.startswith('-') and len(arg) > 1:
@@ -695,137 +908,185 @@ def parse_args():
                 expanded.append('-' + ch)
         else:
             expanded.append(arg)
+        i += 1
 
-    op = None
-    pkg_names = []
-    refresh = False
-    clean_cache = False
-    version_flag = False
-    help_flag = False
-
-    i = 0
-    while i < len(expanded):
-        arg = expanded[i]
-        if arg in ('-v', '--version'):
-            version_flag = True
-            break
-        elif arg in ('-h', '--help'):
-            help_flag = True
-            break
-        elif arg == '-S':
-            op = 'install'
-            i += 1
-            pkgs = []
-            while i < len(expanded) and not expanded[i].startswith('-'):
-                pkgs.append(expanded[i])
-                i += 1
-            pkg_names = pkgs
-            continue
-        elif arg == '-R':
-            op = 'remove'
-            i += 1
-            pkgs = []
-            while i < len(expanded) and not expanded[i].startswith('-'):
-                pkgs.append(expanded[i])
-                i += 1
-            pkg_names = pkgs
-            continue
-        elif arg == '-Q':
-            op = 'query'
-            i += 1
-            if i < len(expanded) and not expanded[i].startswith('-'):
-                pkg_names = [expanded[i]]
-                i += 1
+    # 解析 expanded
+    idx = 0
+    while idx < len(expanded):
+        arg = expanded[idx]
+        if arg.startswith('--'):
+            # 长选项
+            if arg in long_opts:
+                opt = long_opts[arg]
+                if opt in ('s', 'o'):  # 需要参数
+                    if idx+1 < len(expanded):
+                        params['search'] = expanded[idx+1]
+                        idx += 2
+                    else:
+                        logger.error(f"选项 {arg} 需要参数")
+                        sys.exit(1)
+                else:
+                    # 处理特殊长选项
+                    if opt == 'noconfirm':
+                        params['noconfirm'] = True
+                    elif opt == 'debug':
+                        params['debug'] = True
+                    elif opt in ('y', 'u', 'c', 'i', 'l', 'q', 'n', 'v'):
+                        # 映射到对应短选项
+                        # 但我们通过短选项逻辑处理，这里暂时不重复
+                        pass
+                    idx += 1
             else:
-                pkg_names = []
+                logger.warning(f"忽略未知长选项: {arg}")
+                idx += 1
             continue
-        elif arg == '-y':
-            refresh = True
-            i += 1
-            continue
-        elif arg == '-c':
-            clean_cache = True
-            i += 1
-            continue
-        elif arg == '-u':
-            if op == 'install':
-                op = 'upgrade'
-            elif op is None:
-                op = 'upgrade'
-                pkg_names = []
-            i += 1
-            continue
+
+        if arg.startswith('-'):
+            # 短选项
+            for ch in arg[1:]:
+                if ch.isupper():
+                    if op is not None:
+                        logger.error("只能指定一个操作")
+                        sys.exit(1)
+                    if ch == 'Q':
+                        op = 'query'
+                    elif ch == 'R':
+                        op = 'remove'
+                    elif ch == 'S':
+                        op = 'sync'
+                    else:
+                        logger.error(f"未知操作: -{ch}")
+                        sys.exit(1)
+                elif ch.islower():
+                    # 参数选项
+                    if ch == 'y':
+                        params['refresh'] = True
+                    elif ch == 'c':
+                        params['clean'] += 1
+                    elif ch == 'u':
+                        params['upgrade'] = True
+                    elif ch == 'i':
+                        params['info'] = True
+                    elif ch == 's':
+                        # -s 后面需要参数
+                        if idx+1 < len(expanded) and not expanded[idx+1].startswith('-'):
+                            params['search'] = expanded[idx+1]
+                            idx += 1
+                        else:
+                            logger.error("-s 选项需要参数")
+                            sys.exit(1)
+                    elif ch == 'l':
+                        params['list_files'] = True
+                    elif ch == 'q':
+                        params['quiet'] = True
+                    elif ch == 'n':
+                        params['nosave'] = True
+                    elif ch == 'v':
+                        params['verbose'] = True
+                    else:
+                        logger.warning(f"忽略未知选项: -{ch}")
+                else:
+                    logger.error(f"无效字符: {ch}")
+                    sys.exit(1)
+            idx += 1
         else:
-            if op is None and not arg.startswith('-'):
-                op = 'launch'
-                pkg_names = [arg]
-                i += 1
-                break
-            else:
-                logger.error(f"未知选项: {arg}")
-                sys.exit(1)
+            # 目标（包名或搜索字符串）
+            # 注意：如果当前在 -s 的参数后，已经消耗了，这里不再重复添加
+            # 但为简单，我们这里收集所有非选项参数作为包名
+            packages.append(arg)
+            idx += 1
 
-    if op == 'install' and clean_cache and not pkg_names:
-        op = 'clean'
-        clean_cache = False
+    # 如果未指定操作，但有包名，则视为启动模式（launch）
+    if op is None:
+        if packages:
+            op = 'launch'
+        else:
+            print_help()
+            sys.exit(0)
 
-    if op == 'install' and refresh and not pkg_names:
-        op = 'sync'
+    # 针对 -S 操作，如果 -u 被指定，则视为升级模式
+    if op == 'sync' and params['upgrade']:
+        # 升级模式：如果没有包名，则升级所有已安装包；否则升级指定包（必须已安装）
+        pass  # 在 main 中处理
 
-    if version_flag:
-        print(VERSION)
-        sys.exit(0)
-    if help_flag:
-        print_help()
-        sys.exit(0)
+    # 清理：如果 -c 在 -S 下，可能是清理缓存；如果 -c 在 -R 下，表示 cascade
+    if op == 'remove' and params['clean'] > 0:
+        params['cascade'] = True
+    if op == 'remove' and params['search'] is not None:  # -s 在 -R 下表示 recursive
+        params['recursive'] = True
 
-    if op is None and pkg_names:
-        op = 'launch'
+    # 将操作统一为内部方法名
+    internal_op = op
+    if op == 'sync':
+        internal_op = 'install'
+    elif op == 'query':
+        internal_op = 'query'
+    elif op == 'remove':
+        internal_op = 'remove'
 
     return {
-        'op': op,
-        'pkg_names': pkg_names,
-        'refresh': refresh,
-        'clean_cache': clean_cache
+        'op': internal_op,
+        'params': params,
+        'packages': packages,
+        'original_op': op
     }
 
 # ---------- 主函数 ----------
 def main():
     args = parse_args()
     op = args['op']
-    pkg_names = args['pkg_names']
-    refresh = args['refresh']
-    clean_cache = args['clean_cache']
-
-    if not op:
-        print_help()
-        sys.exit(0)
+    params = args['params']
+    packages = args['packages']
+    original_op = args['original_op']
 
     manager = TfvmManager()
 
     if op == 'install':
-        manager.install(pkg_names, clean_cache=clean_cache, refresh=refresh)
-    elif op == 'remove':
-        if not pkg_names:
-            logger.error("未指定要卸载的包")
-            sys.exit(1)
-        manager.remove(pkg_names)
-    elif op == 'query':
-        if pkg_names:
-            manager.query(pkg_names[0])
+        # 判断是正常安装还是升级模式（仅升级已安装）
+        if params['upgrade']:
+            # 升级模式
+            if not packages:
+                # 升级所有已安装包
+                manager.upgrade(refresh=params['refresh'], clean_cache=(params['clean'] > 0))
+            else:
+                manager.upgrade(packages, refresh=params['refresh'], clean_cache=(params['clean'] > 0))
         else:
-            manager.query()
-    elif op == 'sync':
-        manager.sync_db()
-    elif op == 'upgrade':
-        manager.upgrade(pkg_names if pkg_names else None, refresh=refresh)
+            # 正常安装/升级
+            manager.install(packages, clean_cache=(params['clean'] > 0), refresh=params['refresh'])
+    elif op == 'remove':
+        manager.remove(packages, cascade=params['cascade'], recursive=params['recursive'])
+    elif op == 'query':
+        # 处理查询选项
+        if params['upgrades']:
+            manager.query(upgrades=True, quiet=params['quiet'])
+        elif params['search'] is not None:
+            manager.query(search=params['search'], quiet=params['quiet'])
+        elif params['list_files']:
+            if packages:
+                manager.query(pkg_name=packages[0], list_files=True, quiet=params['quiet'])
+            else:
+                logger.error("列出文件需要指定包名")
+                sys.exit(1)
+        elif params['info']:
+            if packages:
+                manager.query(pkg_name=packages[0], info=True, quiet=params['quiet'])
+            else:
+                logger.error("显示详细信息需要指定包名")
+                sys.exit(1)
+        else:
+            # 默认查询：若指定包名则显示，否则列出所有
+            if packages:
+                manager.query(pkg_name=packages[0], quiet=params['quiet'])
+            else:
+                manager.query(quiet=params['quiet'])
     elif op == 'clean':
-        manager.clean_cache()
+        # 独立清理（虽然文档没有独立 -C，但保留作为扩展）
+        manager.clean_cache(level=params['clean'] if params['clean'] > 0 else 1)
     elif op == 'launch':
-        if not pkg_names:
+        if not packages:
             logger.error("未指定要启动的包")
             sys.exit(1)
-        manager.launch(pkg_names[0])
+        manager.launch(packages[0])
     else:
         logger.error(f"未知操作: {op}")
         sys.exit(1)

@@ -81,10 +81,11 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 # ---------- 常量 ----------
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 
 DEFAULT_CONFIG = {
     "registry": "https://reg.touchfish.us.ci/db.yml",
+    "proxy": "https://v4.gh-proxy.org",          # 新增代理前缀
     "sudo_at_start": False,
     "install_prefix": "/usr/local",
     "install_root": "/opt/tfvm",
@@ -148,6 +149,10 @@ class Config:
 
     def get(self, key, default=None):
         return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+        self.save()
 
 # ---------- 包数据库 ----------
 class PackageDB:
@@ -267,9 +272,21 @@ class TfvmManager:
                 sys.exit(1)
 
     def _download_file(self, url: str, dest: str):
-        logger.info(f"下载: {url}")
+        # 代理支持
+        proxy = self.config.get('proxy')
+        if proxy:
+            # 拼接代理前缀
+            if proxy.endswith('/'):
+                full_url = proxy + url
+            else:
+                full_url = proxy + '/' + url
+            logger.info(f"使用代理: {proxy}")
+        else:
+            full_url = url
+
+        logger.info(f"下载: {full_url}")
         try:
-            resp = requests.get(url, stream=True, timeout=60)
+            resp = requests.get(full_url, stream=True, timeout=60)
             resp.raise_for_status()
             total_size = int(resp.headers.get('content-length', 0))
             desc = os.path.basename(dest)
@@ -376,29 +393,36 @@ class TfvmManager:
         return result
 
     def _install_pkg(self, pkg_name: str, pkg_info: dict, skip_download=False):
+        # 检查已安装版本
         if self.installed.is_installed(pkg_name):
             current_version = self.installed.get_installed_version(pkg_name)
             new_version = pkg_info.get('Version')
-            if current_version == new_version:
+            # 如果当前版本是 "build"，强制重新安装（无论远程版本如何）
+            if current_version == "build":
+                logger.info(f"包 {pkg_name} 是 build 版本，强制重新安装")
+            elif current_version == new_version:
                 logger.info(f"包 {pkg_name} 已是最新版本 {current_version}")
                 return
             else:
                 logger.info(f"升级包 {pkg_name}: {current_version} -> {new_version}")
-                info = self.installed.data.get(pkg_name, {})
-                symlink = info.get('symlink')
-                install_dir = info.get('install_dir')
-                if symlink and os.path.islink(symlink):
-                    if not run_sudo(['rm', '-f', symlink]):
-                        logger.error(f"删除旧符号链接失败: {symlink}")
-                        sys.exit(1)
-                    logger.info(f"已删除旧符号链接: {symlink}")
-                if install_dir and os.path.exists(install_dir):
-                    if not run_sudo(['rm', '-rf', install_dir]):
-                        logger.error(f"删除旧安装目录失败: {install_dir}")
-                        sys.exit(1)
-                    logger.info(f"已删除旧安装目录: {install_dir}")
-                self.installed.remove_pkg(pkg_name)
 
+            # 卸载旧版本
+            info = self.installed.data.get(pkg_name, {})
+            symlink = info.get('symlink')
+            install_dir = info.get('install_dir')
+            if symlink and os.path.islink(symlink):
+                if not run_sudo(['rm', '-f', symlink]):
+                    logger.error(f"删除旧符号链接失败: {symlink}")
+                    sys.exit(1)
+                logger.info(f"已删除旧符号链接: {symlink}")
+            if install_dir and os.path.exists(install_dir):
+                if not run_sudo(['rm', '-rf', install_dir]):
+                    logger.error(f"删除旧安装目录失败: {install_dir}")
+                    sys.exit(1)
+                logger.info(f"已删除旧安装目录: {install_dir}")
+            self.installed.remove_pkg(pkg_name)
+
+        # 冲突检查
         status, msg = self._check_path_conflict(pkg_name)
         if status == 'conflict':
             logger.error(f"包 {pkg_name}: {msg}")
@@ -604,10 +628,6 @@ class TfvmManager:
             self._install_pkg(pkg, pkg_info, skip_download=True)
 
     def upgrade(self, pkg_names=None, refresh=False, clean_cache=False):
-        """
-        仅升级已安装的包。若 pkg_names 为 None 或空，则升级所有已安装包。
-        若指定包名但未安装，则报错。
-        """
         self._check_sudo_requirement()
         if refresh:
             self.db.sync()
@@ -629,7 +649,6 @@ class TfvmManager:
 
     def remove(self, pkg_names: list, cascade=False, recursive=False):
         self._check_sudo_requirement()
-        # 若 cascade 或 recursive，需处理依赖关系（简化实现：直接卸载，并提示依赖）
         if cascade:
             logger.warning("级联删除功能暂未完全实现，将只卸载目标包及其直接依赖（如果有）")
         if recursive:
@@ -657,7 +676,6 @@ class TfvmManager:
 
     def query(self, pkg_name=None, info=False, search=None, list_files=False, upgrades=False, quiet=False):
         if upgrades:
-            # 列出可更新的包
             upgradable = []
             for name, inst in self.installed.get_all().items():
                 pkg_info = self.db.get_pkg(name)
@@ -675,7 +693,6 @@ class TfvmManager:
             return
 
         if search:
-            # 搜索已安装包（支持正则）
             pattern = re.compile(search, re.IGNORECASE)
             found = []
             for name, pkg_info in self.db.packages.items():
@@ -720,7 +737,6 @@ class TfvmManager:
                 return
             installed = self.installed.is_installed(pkg_name)
             if info:
-                # 显示详细信息
                 print(f"名称: {pkg_name}")
                 print(f"全名: {info_data.get('Name', '')}")
                 print(f"说明: {info_data.get('Comment', '')}")
@@ -735,7 +751,6 @@ class TfvmManager:
                 status = colorize("已安装", 'GREEN') if installed else colorize("未安装", 'RED')
                 print(f"{pkg_name} {info_data.get('Version', '')} - {info_data.get('Name', '')} [{status}]")
         else:
-            # 列出所有包
             for name in sorted(self.db.list_pkgs()):
                 info_data = self.db.get_pkg(name)
                 installed = self.installed.is_installed(name)
@@ -753,7 +768,6 @@ class TfvmManager:
         if not os.path.exists(cache_dir):
             return
         if level == 1:
-            # 只删除未安装的包（暂简化为删除所有缓存）
             shutil.rmtree(cache_dir)
             ensure_dir(cache_dir)
             logger.info("缓存已清理（所有文件）")
@@ -774,7 +788,62 @@ class TfvmManager:
             sys.exit(1)
         os.execv(exec_path, [exec_path] + sys.argv[2:])
 
-# ---------- 命令行解析（Pacman 风格） ----------
+    # ---------- 配置管理命令 ----------
+    def config_set(self, subcmd, values):
+        if subcmd == 'r':
+            # 修改 registry
+            if not values:
+                logger.error("缺少 registry URL")
+                return
+            new_url = values[0]
+            self.config.set('registry', new_url)
+            logger.info(colorize(f"registry 已更新为: {new_url}", 'GREEN'))
+        elif subcmd == 'p':
+            # 修改 proxy
+            if values:
+                new_proxy = values[0]
+            else:
+                new_proxy = ""
+            self.config.set('proxy', new_proxy)
+            if new_proxy:
+                logger.info(colorize(f"proxy 已设置为: {new_proxy}", 'GREEN'))
+            else:
+                logger.info(colorize("proxy 已清除（不使用代理）", 'GREEN'))
+        elif subcmd == 't':
+            # 转移本地数据库到指定目录
+            if not values:
+                logger.error("缺少目标目录")
+                return
+            target_dir = expand_path(values[0])
+            if not os.path.exists(target_dir):
+                try:
+                    Path(target_dir).mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    logger.error(f"无法创建目录 {target_dir}: {e}")
+                    return
+            # 移动 db_file 和 installed_db
+            db_file = self.config.get('db_file')
+            inst_db = self.config.get('installed_db')
+            if not os.path.exists(db_file) and not os.path.exists(inst_db):
+                logger.warning("数据库文件不存在，无需移动")
+                return
+            # 移动 db_file
+            if os.path.exists(db_file):
+                new_db = os.path.join(target_dir, os.path.basename(db_file))
+                shutil.move(db_file, new_db)
+                self.config.set('db_file', new_db)
+                logger.info(f"移动 db.yml 到 {new_db}")
+            # 移动 installed_db
+            if os.path.exists(inst_db):
+                new_inst = os.path.join(target_dir, os.path.basename(inst_db))
+                shutil.move(inst_db, new_inst)
+                self.config.set('installed_db', new_inst)
+                logger.info(f"移动 installed.json 到 {new_inst}")
+            logger.info(colorize("数据库文件已转移", 'GREEN'))
+        else:
+            logger.error(f"未知配置子命令: {subcmd}")
+
+# ---------- 命令行解析（Pacman 风格，增加 -C） ----------
 def print_help():
     help_text = f"""
 {colorize('TouchFish Version Manager (tfvm) v' + VERSION, 'CYAN')}
@@ -785,56 +854,40 @@ def print_help():
   -Q, --query         查询本地数据库（已安装包）
   -R, --remove        移除软件包
   -S, --sync          同步/安装软件包
+  -C, --config        配置管理（后接子命令）
+
+配置子命令 (-C):
+  -Cr <url>           修改远程数据库地址
+  -Cp <proxy>         修改代理前缀（设为空字符串清除代理）
+  -Ct <目录>          移动本地数据库文件到新目录
 
 查询操作 (-Q) 选项:
-  -c, --changelog     查看包的更新日志（暂未实现）
-  -d, --deps          仅列出作为依赖项安装的包
-  -e, --explicit      仅列出主动安装的包
-  -g, --groups        查看包所属的组
   -i, --info          显示包的详细信息
-  -k, --check         检查包的文件是否存在
+  -s, --search <表达式> 搜索已安装的包（支持正则）
   -l, --list          列出包安装的所有文件
-  -o, --owns <文件>   查询文件属于哪个包
-  -s, --search <表达式> 搜索已安装的包
-  -t, --unrequired    列出孤立包（不被任何包需要）
   -u, --upgrades      列出所有可更新的包
-  -q, --quiet         输出精简信息
+  -q, --quiet         精简输出
 
 移除操作 (-R) 选项:
-  -c, --cascade       级联删除（移除目标包及依赖它们的包）
-  -n, --nosave        移除时不保留配置文件（默认保留为 .pacsave）
-  -s, --recursive     递归删除（移除不被需要的依赖）
-  -u, --unneeded      移除不被需要的目标包
+  -c, --cascade       级联删除
+  -s, --recursive     递归删除
+  -n, --nosave        移除时不保留配置文件
 
 同步操作 (-S) 选项:
+  -y, --refresh       刷新同步数据库
   -c, --clean         清理缓存（一次删除未安装包，两次清空全部）
-  -i, --info          显示远程仓库包的详细信息
-  -l, --list          列出指定仓库的所有包
-  -s, --search <表达式> 在远程仓库中搜索包
-  -u, --sysupgrade    升级系统（升级所有已安装包或指定包）
-  -y, --refresh       刷新同步数据库（一次刷新，两次强制刷新）
-  -q, --quiet         输出精简信息
-
-通用选项:
-  -v, --verbose       输出详细执行过程
-  --noconfirm         不询问确认
-  --debug             输出调试信息
-  -h, --help          显示帮助
+  -u, --sysupgrade    升级模式（仅升级已安装包，未安装则报错）
+  -i, --info          显示远程仓库包的详细信息（未实现）
+  -s, --search <表达式> 在远程仓库中搜索包（未实现）
+  -q, --quiet         精简输出
 
 示例:
   tfvm -S touchfish              安装/升级 touchfish
   tfvm -Syu                      同步数据库并升级所有包
-  tfvm -S -u touchfish           仅升级 touchfish（若未安装则报错）
-  tfvm -S -c                     清理缓存（删除未安装的包）
-  tfvm -S -cc                    清空整个缓存
-  tfvm -Q                        列出所有已安装包
-  tfvm -Q -i tfvm                显示 tfvm 详细信息
-  tfvm -Q -s "fish"              搜索已安装包中包含 "fish" 的
-  tfvm -Q -u                     列出可更新的包
-  tfvm -Q -l touchfish           列出 touchfish 安装的文件
-  tfvm -R touchfish              卸载 touchfish
-  tfvm -R -c touchfish           级联删除 touchfish（及依赖它的包）
-  tfvm touchfish                 启动已安装的 touchfish
+  tfvm -Cr https://new.repo/db.yml  修改仓库地址
+  tfvm -Cp ""                    禁用代理
+  tfvm -Ct /new/db/path          移动数据库文件
+  tfvm touchfish                 启动已安装的包
 """
     print(help_text)
 
@@ -844,7 +897,6 @@ def parse_args():
         print_help()
         sys.exit(0)
 
-    # 处理 -v, -h (独立)
     if '-v' in raw or '--version' in raw:
         print(VERSION)
         sys.exit(0)
@@ -854,95 +906,70 @@ def parse_args():
 
     op = None
     params = {
-        'refresh': False,      # -y
-        'clean': 0,            # -c 数量
-        'upgrade': False,      # -u (针对 -S)
-        'info': False,         # -i
-        'search': None,        # -s <expr>
-        'list_files': False,   # -l
-        'quiet': False,        # -q
-        'cascade': False,      # -c (针对 -R)
-        'recursive': False,    # -s (针对 -R)
-        'nosave': False,       # -n
-        'unneeded': False,     # -u (针对 -R)
-        'verbose': False,      # -v
-        'noconfirm': False,    # --noconfirm
-        'debug': False,        # --debug
+        'refresh': False,
+        'clean': 0,
+        'upgrade': False,
+        'info': False,
+        'search': None,
+        'list_files': False,
+        'quiet': False,
+        'cascade': False,
+        'recursive': False,
+        'nosave': False,
+        'verbose': False,
+        'noconfirm': False,
+        'debug': False,
+        'config_subcmd': None,
+        'config_values': []
     }
     packages = []
 
-    # 用于收集长选项（如 --noconfirm）
-    long_opts = {
-        '--sync': 'S',
-        '--query': 'Q',
-        '--remove': 'R',
-        '--refresh': 'y',
-        '--sysupgrade': 'u',
-        '--clean': 'c',
-        '--info': 'i',
-        '--search': 's',
-        '--list': 'l',
-        '--quiet': 'q',
-        '--cascade': 'c',
-        '--recursive': 's',
-        '--nosave': 'n',
-        '--unneeded': 'u',
-        '--verbose': 'v',
-        '--noconfirm': 'noconfirm',
-        '--debug': 'debug',
-        '--help': 'h',
-        '--version': 'v',
-    }
-
-    # 先尝试识别操作（第一个非选项参数可能是操作，也可能直接是包名）
-    # 但也可以先扫描所有参数，提取操作
-    # 为了支持 -Syu 这种组合，我们先将所有参数展开为单字符列表（长选项除外）
     expanded = []
     i = 0
     while i < len(raw):
         arg = raw[i]
-        if arg.startswith('--'):
+        # 将 -Cr 等特殊选项保留为整体，不展开（因为 -C 后面跟小写字母表示子命令）
+        if arg.startswith('-C') and len(arg) == 3 and arg[2].islower():
             expanded.append(arg)
-        elif arg.startswith('-') and len(arg) > 1:
-            for ch in arg[1:]:
-                expanded.append('-' + ch)
         else:
-            expanded.append(arg)
+            # 普通短选项展开
+            if arg.startswith('--'):
+                expanded.append(arg)
+            elif arg.startswith('-') and len(arg) > 1:
+                for ch in arg[1:]:
+                    expanded.append('-' + ch)
+            else:
+                expanded.append(arg)
         i += 1
 
-    # 解析 expanded
     idx = 0
     while idx < len(expanded):
         arg = expanded[idx]
         if arg.startswith('--'):
-            # 长选项
-            if arg in long_opts:
-                opt = long_opts[arg]
-                if opt in ('s', 'o'):  # 需要参数
-                    if idx+1 < len(expanded):
-                        params['search'] = expanded[idx+1]
-                        idx += 2
-                    else:
-                        logger.error(f"选项 {arg} 需要参数")
-                        sys.exit(1)
-                else:
-                    # 处理特殊长选项
-                    if opt == 'noconfirm':
-                        params['noconfirm'] = True
-                    elif opt == 'debug':
-                        params['debug'] = True
-                    elif opt in ('y', 'u', 'c', 'i', 'l', 'q', 'n', 'v'):
-                        # 映射到对应短选项
-                        # 但我们通过短选项逻辑处理，这里暂时不重复
-                        pass
-                    idx += 1
-            else:
-                logger.warning(f"忽略未知长选项: {arg}")
-                idx += 1
+            # 长选项简化处理（省略，本版本暂不实现完整长选项）
+            idx += 1
             continue
 
         if arg.startswith('-'):
-            # 短选项
+            # 处理 -C 子命令（整体传入）
+            if arg == '-C':
+                op = 'config'
+                idx += 1
+                # 检查下一个是否为子命令（如 -r, -p, -t）
+                if idx < len(expanded) and expanded[idx].startswith('-') and len(expanded[idx]) == 2 and expanded[idx][1] in ('r', 'p', 't'):
+                    subcmd = expanded[idx][1]
+                    idx += 1
+                    values = []
+                    while idx < len(expanded) and not expanded[idx].startswith('-'):
+                        values.append(expanded[idx])
+                        idx += 1
+                    params['config_subcmd'] = subcmd
+                    params['config_values'] = values
+                else:
+                    logger.error("-C 需要子命令 (r/p/t)")
+                    sys.exit(1)
+                continue
+            # 处理其他短选项
             for ch in arg[1:]:
                 if ch.isupper():
                     if op is not None:
@@ -958,7 +985,6 @@ def parse_args():
                         logger.error(f"未知操作: -{ch}")
                         sys.exit(1)
                 elif ch.islower():
-                    # 参数选项
                     if ch == 'y':
                         params['refresh'] = True
                     elif ch == 'c':
@@ -968,7 +994,6 @@ def parse_args():
                     elif ch == 'i':
                         params['info'] = True
                     elif ch == 's':
-                        # -s 后面需要参数
                         if idx+1 < len(expanded) and not expanded[idx+1].startswith('-'):
                             params['search'] = expanded[idx+1]
                             idx += 1
@@ -990,39 +1015,27 @@ def parse_args():
                     sys.exit(1)
             idx += 1
         else:
-            # 目标（包名或搜索字符串）
-            # 注意：如果当前在 -s 的参数后，已经消耗了，这里不再重复添加
-            # 但为简单，我们这里收集所有非选项参数作为包名
             packages.append(arg)
             idx += 1
 
-    # 如果未指定操作，但有包名，则视为启动模式（launch）
-    if op is None:
-        if packages:
-            op = 'launch'
-        else:
-            print_help()
-            sys.exit(0)
+    if op is None and packages:
+        op = 'launch'
+    elif op is None:
+        print_help()
+        sys.exit(0)
 
-    # 针对 -S 操作，如果 -u 被指定，则视为升级模式
+    # 针对 -S -u 处理为升级模式
     if op == 'sync' and params['upgrade']:
-        # 升级模式：如果没有包名，则升级所有已安装包；否则升级指定包（必须已安装）
-        pass  # 在 main 中处理
+        pass
 
-    # 清理：如果 -c 在 -S 下，可能是清理缓存；如果 -c 在 -R 下，表示 cascade
     if op == 'remove' and params['clean'] > 0:
         params['cascade'] = True
-    if op == 'remove' and params['search'] is not None:  # -s 在 -R 下表示 recursive
+    if op == 'remove' and params['search'] is not None:
         params['recursive'] = True
 
-    # 将操作统一为内部方法名
     internal_op = op
     if op == 'sync':
         internal_op = 'install'
-    elif op == 'query':
-        internal_op = 'query'
-    elif op == 'remove':
-        internal_op = 'remove'
 
     return {
         'op': internal_op,
@@ -1037,27 +1050,26 @@ def main():
     op = args['op']
     params = args['params']
     packages = args['packages']
-    original_op = args['original_op']
 
     manager = TfvmManager()
 
+    # 处理配置子命令（优先执行，不依赖其他操作）
+    if args['original_op'] == 'config':
+        manager.config_set(params['config_subcmd'], params['config_values'])
+        return
+
     if op == 'install':
-        # 判断是正常安装还是升级模式（仅升级已安装）
         if params['upgrade']:
-            # 升级模式
             if not packages:
-                # 升级所有已安装包
                 manager.upgrade(refresh=params['refresh'], clean_cache=(params['clean'] > 0))
             else:
                 manager.upgrade(packages, refresh=params['refresh'], clean_cache=(params['clean'] > 0))
         else:
-            # 正常安装/升级
             manager.install(packages, clean_cache=(params['clean'] > 0), refresh=params['refresh'])
     elif op == 'remove':
         manager.remove(packages, cascade=params['cascade'], recursive=params['recursive'])
     elif op == 'query':
-        # 处理查询选项
-        if params['upgrades']:
+        if params.get('upgrade', False):
             manager.query(upgrades=True, quiet=params['quiet'])
         elif params['search'] is not None:
             manager.query(search=params['search'], quiet=params['quiet'])
@@ -1074,13 +1086,11 @@ def main():
                 logger.error("显示详细信息需要指定包名")
                 sys.exit(1)
         else:
-            # 默认查询：若指定包名则显示，否则列出所有
             if packages:
                 manager.query(pkg_name=packages[0], quiet=params['quiet'])
             else:
                 manager.query(quiet=params['quiet'])
     elif op == 'clean':
-        # 独立清理（虽然文档没有独立 -C，但保留作为扩展）
         manager.clean_cache(level=params['clean'] if params['clean'] > 0 else 1)
     elif op == 'launch':
         if not packages:

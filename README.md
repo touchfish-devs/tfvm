@@ -8,15 +8,14 @@
 
 ---
 
-## ✨ 功能特性
+## 功能特性
 
 - **Pacman‑风格命令行** – 熟悉的 `-S`、`-R`、`-Q` 操作和丰富的选项（`-y`、`-u`、`-c`、`-i`、`-s`、`-l` 等）。
 - **多格式支持** – 自动识别并安装 `.tar.gz`、`.tar.xz`、`.zst`、`.zip`、`.AppImage` 等多种归档/可执行格式。
 - **智能依赖管理** – 递归解析依赖，按拓扑顺序安装，确保依赖始终为最新版本。
-- **两阶段安装** – 先全部下载包文件，再统一安装，减少网络中断风险。
 - **路径冲突检查** – 安装前检测系统中同名命令，根据 PATH 顺序给出警告或阻止安装。
 - **自我更新** – `tfvm` 可管理自身，通过 `-Syu` 一键升级，安装脚本自动自举。
-- **跨发行版安装** – 官方安装脚本支持 Debian/Ubuntu、Arch、Fedora/RHEL，自动安装系统依赖。
+- **跨发行版安装** – 支持 Debian/Ubuntu、Arch、Fedora/RHEL，自动安装系统依赖。
 - **彩色输出与进度条** – 清晰的日志分级和下载进度显示（支持 `tqdm`）。
 
 ---
@@ -36,7 +35,7 @@ python3 main.py -S tfvm
 ```
 
 执行 `-S tfvm` 会：
-- 同步远程数据库（若远程无 `tfvm` 条目，程序会自动生成默认条目）。
+- 同步远程数据库。
 - 下载 `tfvm` 源码包并安装到 `/opt/tfvm/tfvm`。
 - 创建 `/usr/local/bin/tfvm` 符号链接。
 
@@ -79,16 +78,16 @@ tfvm -S -u touchfish
 tfvm -Q
 
 # 显示 touchfish 的详细信息
-tfvm -Q -i touchfish
+tfvm -Qi touchfish
 
 # 搜索已安装包中包含 "fish" 的
-tfvm -Q -s "fish"
+tfvm -Qs "fish"
 
 # 列出可更新的包
-tfvm -Q -u
+tfvm -Qu
 
 # 列出 touchfish 安装的所有文件
-tfvm -Q -l touchfish
+tfvm -Ql touchfish
 ```
 
 #### 移除操作
@@ -97,16 +96,16 @@ tfvm -Q -l touchfish
 tfvm -R touchfish
 
 # 级联删除（卸载 touchfish 及依赖它的包）
-tfvm -R -c touchfish
+tfvm -Rc touchfish
 ```
 
 #### 其他
 ```bash
 # 清理缓存（删除未安装的包）
-tfvm -S -c
+tfvm -Sc
 
 # 清空整个缓存
-tfvm -S -cc
+tfvm -Scc
 
 # 启动已安装的包（等同于直接执行命令）
 tfvm touchfish

@@ -22,14 +22,10 @@ def load_language(lang_code):
         mod = importlib.import_module(f'lang.{lang_code}')
         return mod._
     except ImportError:
-        # 回退到英文
         mod = importlib.import_module('lang.en')
         return mod._
 
-# 先加载配置以获取语言设置（但配置尚未加载，需要延迟）
-# 我们将在 Config 加载后调用 load_language
-
-# ---------- 颜色支持 ----------
+# ---------- 颜色 ----------
 COLORS = {
     'RED': '\033[91m',
     'GREEN': '\033[92m',
@@ -43,7 +39,7 @@ COLORS = {
 def colorize(text, color):
     return f"{COLORS.get(color, '')}{text}{COLORS['RESET']}"
 
-# ---------- 进度条支持 ----------
+# ---------- 进度条 ----------
 try:
     from tqdm import tqdm
     HAS_TQDM = True
@@ -76,7 +72,7 @@ except ImportError:
             sys.stdout.flush()
     tqdm = tqdm_dummy
 
-# ---------- 日志配置（带颜色） ----------
+# ---------- 日志 ----------
 class ColorFormatter(logging.Formatter):
     def format(self, record):
         levelname = record.levelname
@@ -95,7 +91,7 @@ logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
 # ---------- 常量 ----------
-VERSION = "1.3.5"
+VERSION = "1.3.4"
 
 DEFAULT_CONFIG = {
     "registry": "https://reg.touchfish.us.ci/db.yml",
@@ -106,13 +102,14 @@ DEFAULT_CONFIG = {
     "cache_dir": "~/.tfvm/cache",
     "db_file": "~/.tfvm/db.yml",
     "installed_db": "~/.tfvm/installed.json",
-    "lang": "en"          # 新增语言配置
+    "lang": "en",
+    "noconfirm": False
 }
 
-# ---------- 全局翻译函数 ----------
-_ = None  # 稍后初始化
+# ---------- 全局翻译 ----------
+_ = None
 
-# ---------- 辅助函数 ----------
+# ---------- 辅助 ----------
 def expand_path(path: str) -> str:
     if path is None:
         return None
@@ -132,13 +129,12 @@ def run_sudo(cmd: list):
 def is_root() -> bool:
     return os.geteuid() == 0
 
-# ---------- 配置管理 ----------
+# ---------- 配置 ----------
 class Config:
     def __init__(self):
         self.config_path = expand_path("~/tfvm.json")
         self.data = self.load()
         self._expand_paths()
-        # 加载语言
         lang_code = self.data.get('lang', 'en')
         global _
         _ = load_language(lang_code)
@@ -153,7 +149,6 @@ class Config:
                     data[key] = value
             return data
         else:
-            # 首次启动，使用默认配置（语言为 en）
             self.data = DEFAULT_CONFIG.copy()
             self.save()
             return self.data
@@ -176,7 +171,6 @@ class Config:
     def set(self, key, value):
         self.data[key] = value
         self.save()
-        # 如果修改了语言，重新加载
         if key == 'lang':
             global _
             _ = load_language(value)
@@ -235,6 +229,11 @@ class PackageDB:
     def list_pkgs(self):
         return self.packages.keys()
 
+    # NEW: 添加新包到数据库
+    def add_pkg(self, name: str, pkg_info: dict):
+        self.packages[name] = pkg_info
+        self.save()
+
 # ---------- 已安装包管理 ----------
 class InstalledDB:
     def __init__(self, config: Config):
@@ -260,12 +259,15 @@ class InstalledDB:
     def get_installed_version(self, name: str):
         return self.data.get(name, {}).get('version')
 
-    def add_pkg(self, name: str, version: str, install_dir: str, symlink_path: str):
-        self.data[name] = {
+    def add_pkg(self, name: str, version: str, install_dir: str, symlink_path: str, provides: list = None):
+        entry = {
             'version': version,
             'install_dir': install_dir,
             'symlink': symlink_path
         }
+        if provides:
+            entry['provides'] = provides
+        self.data[name] = entry
         self.save()
 
     def remove_pkg(self, name: str):
@@ -275,6 +277,21 @@ class InstalledDB:
 
     def get_all(self):
         return self.data
+
+    def get_provides(self, pkg_name: str):
+        entry = self.data.get(pkg_name, {})
+        return entry.get('provides', [])
+
+    def get_packages_providing(self, provide_name: str, exclude: list = None):
+        result = []
+        exclude = exclude or []
+        for pkg, info in self.data.items():
+            if pkg in exclude:
+                continue
+            prov = info.get('provides', [])
+            if provide_name in prov:
+                result.append(pkg)
+        return result
 
 # ---------- 核心包管理器 ----------
 class TfvmManager:
@@ -295,7 +312,7 @@ class TfvmManager:
     def _check_sudo_requirement(self):
         if self.config.get('sudo_at_start', False):
             if not is_root():
-                logger.error(_('sudo_required'))  # 需要添加
+                logger.error("需要 root 权限，请使用 sudo")
                 sys.exit(1)
 
     def _download_file(self, url: str, dest: str):
@@ -400,22 +417,76 @@ class TfvmManager:
         else:
             return 'none', ''
 
-    def _resolve_dependencies(self, pkg_name: str, pkg_info: dict, visited: set):
-        if pkg_name in visited:
-            return []
-        visited.add(pkg_name)
+    # ---------- 依赖解析（含 Provides） ----------
+    def _resolve_dependencies_with_provides(self, pkg_names: list, upgrade_mode: bool = False):
+        all_pkgs = []
+        visited = set()
+        queue = list(pkg_names)
 
-        deps = pkg_info.get('Depends', [])
-        result = []
-        for dep in deps:
-            dep_info = self.db.get_pkg(dep)
-            if not dep_info:
-                logger.error(_('pkg_not_in_db').format(dep))
+        while queue:
+            pkg = queue.pop(0)
+            if pkg in visited:
+                continue
+            pkg_info = self.db.get_pkg(pkg)
+            if not pkg_info:
+                logger.error(_('pkg_not_in_db').format(pkg))
                 sys.exit(1)
-            sub = self._resolve_dependencies(dep, dep_info, visited)
-            result.extend(sub)
-            result.append(dep)
-        return result
+            visited.add(pkg)
+            all_pkgs.append(pkg)
+
+            deps = pkg_info.get('Depends', [])
+            for dep in deps:
+                if self.db.get_pkg(dep):
+                    if dep not in visited and dep not in queue:
+                        queue.append(dep)
+                    continue
+                providers = []
+                installed_prov = self.installed.get_packages_providing(dep, exclude=all_pkgs)
+                providers.extend(installed_prov)
+                for p in all_pkgs:
+                    if p == pkg:
+                        continue
+                    p_info = self.db.get_pkg(p)
+                    if p_info and dep in p_info.get('Provides', []):
+                        providers.append(p)
+                if not providers:
+                    logger.error(f"依赖 {dep} 未找到任何提供者（非真实包，也无 Provides）")
+                    sys.exit(1)
+                if len(providers) > 1:
+                    logger.error(f"依赖 {dep} 有多个提供者：{', '.join(providers)}，无法自动选择")
+                    sys.exit(1)
+                provider = providers[0]
+                if provider not in visited and provider not in queue:
+                    queue.append(provider)
+
+        will_install = set(all_pkgs)
+        installed_pkgs = set(self.installed.get_all().keys())
+        prov_map = {}
+        for p in will_install:
+            p_info = self.db.get_pkg(p)
+            if not p_info:
+                continue
+            prov_list = p_info.get('Provides', [])
+            if isinstance(prov_list, str):
+                prov_list = [prov_list]
+            for prov in prov_list:
+                prov_map.setdefault(prov, []).append(p)
+        for p in installed_pkgs - will_install:
+            prov_list = self.installed.get_provides(p)
+            for prov in prov_list:
+                prov_map.setdefault(prov, []).append(p)
+
+        conflicts = []
+        for prov, providers in prov_map.items():
+            if len(providers) > 1:
+                conflicts.append((prov, providers))
+        if conflicts:
+            logger.error("Provides 冲突：")
+            for prov, providers in conflicts:
+                logger.error(f"  {prov} 由多个包提供：{', '.join(providers)}")
+            sys.exit(1)
+
+        return all_pkgs
 
     def _install_pkg(self, pkg_name: str, pkg_info: dict, skip_download=False):
         if self.installed.is_installed(pkg_name):
@@ -510,7 +581,10 @@ class TfvmManager:
                     sys.exit(1)
                 logger.info(f"已创建符号链接: {symlink_path}")
 
-                self.installed.add_pkg(pkg_name, version, target_dir, symlink_path)
+                provides = pkg_info.get('Provides', [])
+                if isinstance(provides, str):
+                    provides = [provides]
+                self.installed.add_pkg(pkg_name, version, target_dir, symlink_path, provides)
                 if pkg_name == 'tfvm':
                     self.upgraded_tfvm = True
                 logger.info(colorize(_('pkg_install_complete').format(pkg_name), 'GREEN'))
@@ -566,7 +640,10 @@ class TfvmManager:
                     sys.exit(1)
                 logger.info(f"已创建符号链接: {symlink_path}")
 
-            self.installed.add_pkg(pkg_name, version, target_dir, symlink_path)
+            provides = pkg_info.get('Provides', [])
+            if isinstance(provides, str):
+                provides = [provides]
+            self.installed.add_pkg(pkg_name, version, target_dir, symlink_path, provides)
             if pkg_name == 'tfvm':
                 self.upgraded_tfvm = True
             logger.info(colorize(_('pkg_install_complete').format(pkg_name), 'GREEN'))
@@ -590,17 +667,7 @@ class TfvmManager:
                     logger.error(_('pkg_not_installed').format(name))
                     sys.exit(1)
 
-        all_pkgs = []
-        visited = set()
-        for name in pkg_names:
-            pkg_info = self.db.get_pkg(name)
-            if not pkg_info:
-                logger.error(_('pkg_not_in_db').format(name))
-                sys.exit(1)
-            deps = self._resolve_dependencies(name, pkg_info, visited)
-            all_pkgs.extend(deps)
-            all_pkgs.append(name)
-        all_pkgs = list(dict.fromkeys(all_pkgs))
+        all_pkgs = self._resolve_dependencies_with_provides(pkg_names, upgrade_mode)
 
         if not all_pkgs:
             logger.info(_('no_pkgs_to_process'))
@@ -619,34 +686,37 @@ class TfvmManager:
             if not upgradable:
                 logger.info(_('no_upgradable_pkgs'))
                 return
-            print(_('upgradable_list_header'))
-            for idx, (name, cur, new) in enumerate(upgradable):
-                print(f"{idx}. {name} {cur} -> {new}")
-            print(_('exclude_prompt'), end=' ')
-            user_input = input().strip()
-            exclude_set = set()
-            if user_input:
-                if user_input.lower() == 'b':
-                    for name, cur, new in upgradable:
-                        if cur == "build" or new == "build":
-                            exclude_set.add(name)
-                else:
-                    parts = user_input.split()
-                    for part in parts:
-                        try:
-                            idx = int(part)
-                            if 0 <= idx < len(upgradable):
-                                exclude_set.add(upgradable[idx][0])
-                            else:
-                                logger.warning(f"无效序号: {idx}")
-                        except ValueError:
-                            logger.warning(f"无效输入: {part}")
-            if exclude_set:
-                all_pkgs = [p for p in all_pkgs if p not in exclude_set]
-                logger.info(_('excluded_pkgs').format(', '.join(exclude_set)))
-                if not all_pkgs:
-                    logger.info(_('no_pkgs_left'))
-                    return
+            if self.config.get('noconfirm', False):
+                logger.info("--noconfirm 已启用，自动更新所有包")
+            else:
+                print(_('upgradable_list_header'))
+                for idx, (name, cur, new) in enumerate(upgradable):
+                    print(f"{idx}. {name} {cur} -> {new}")
+                print(_('exclude_prompt'), end=' ')
+                user_input = input().strip()
+                exclude_set = set()
+                if user_input:
+                    if user_input.lower() == 'b':
+                        for name, cur, new in upgradable:
+                            if cur == "build" or new == "build":
+                                exclude_set.add(name)
+                    else:
+                        parts = user_input.split()
+                        for part in parts:
+                            try:
+                                idx = int(part)
+                                if 0 <= idx < len(upgradable):
+                                    exclude_set.add(upgradable[idx][0])
+                                else:
+                                    logger.warning(f"无效序号: {idx}")
+                            except ValueError:
+                                logger.warning(f"无效输入: {part}")
+                if exclude_set:
+                    all_pkgs = [p for p in all_pkgs if p not in exclude_set]
+                    logger.info(_('excluded_pkgs').format(', '.join(exclude_set)))
+                    if not all_pkgs:
+                        logger.info(_('no_pkgs_left'))
+                        return
 
         conflicts = []
         warnings = []
@@ -668,10 +738,13 @@ class TfvmManager:
                 logger.warning(f"  {pkg}: {msg}")
 
         logger.info(_('processing_pkgs').format(', '.join(all_pkgs)))
-        confirm = input(colorize(_('confirm_continue'), 'YELLOW')).strip().lower()
-        if confirm and confirm != 'y':
-            logger.info(_('operation_cancelled'))
-            return
+        if self.config.get('noconfirm', False):
+            logger.info("--noconfirm 已启用，自动确认")
+        else:
+            confirm = input(colorize(_('confirm_continue'), 'YELLOW')).strip().lower()
+            if confirm and confirm != 'y':
+                logger.info(_('operation_cancelled'))
+                return
 
         logger.info(colorize(_('phase1_download'), 'BLUE'))
         for pkg in all_pkgs:
@@ -804,6 +877,11 @@ class TfvmManager:
                     inst_info = self.installed.data.get(pkg_name, {})
                     print(_('query_pkg_install_dir').format(inst_info.get('install_dir', '')))
                     print(_('query_pkg_symlink').format(inst_info.get('symlink', '')))
+                provides = info_data.get('Provides', [])
+                if provides:
+                    if isinstance(provides, str):
+                        provides = [provides]
+                    print(f"Provides: {', '.join(provides)}")
             else:
                 status = colorize(_('query_pkg_status_installed'), 'GREEN') if installed else colorize(_('query_pkg_status_not_installed'), 'RED')
                 print(f"{pkg_name} {info_data.get('Version', '')} - {info_data.get('Name', '')} [{status}]")
@@ -893,9 +971,86 @@ class TfvmManager:
         else:
             logger.error(_('unknown_config_subcmd').format(subcmd))
 
+    # ---------- NEW: -U 发布命令 ----------
+    def publish(self, subcmd, pkgfile, pkgname, fullname=None, version=None, rel=None, depends=None, provides=None):
+        """
+        发布软件包到数据库，支持 -i 安装，-s 输出 YAML。
+        """
+        # 处理 pkgfile（本地或远程）
+        if re.match(r'^https?://', pkgfile):
+            # 下载到临时文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.tmp') as tmp:
+                local_file = tmp.name
+            self._download_file(pkgfile, local_file)
+            logger.info(f"下载包文件到: {local_file}")
+        else:
+            if not os.path.exists(pkgfile):
+                logger.error(f"包文件不存在: {pkgfile}")
+                sys.exit(1)
+            local_file = pkgfile
+
+        # 交互式补全缺失字段
+        if fullname is None:
+            fullname = input("全名 (Name) [包名]: ").strip() or pkgname
+        if version is None:
+            version = input("版本 (Version) [1.0.0]: ").strip() or "1.0.0"
+        if rel is None:
+            rel_str = input("发布号 (Release) [1]: ").strip() or "1"
+            try:
+                rel = int(rel_str)
+            except ValueError:
+                rel = 1
+        comment = input("描述 (Comment) []: ").strip()
+        exec_path = input("可执行文件路径 (Exec) [包名]: ").strip() or pkgname
+        binary_input = input("需要可执行权限的文件列表 (Binary, 空格分隔) []: ").strip()
+        binaries = binary_input.split() if binary_input else []
+
+        # 处理 Depends 和 Provides
+        if depends is None:
+            dep_input = input("依赖 (Depends, 空格分隔) []: ").strip()
+            depends = dep_input.split() if dep_input else []
+        else:
+            # 已从命令行提供
+            pass
+        if provides is None:
+            prov_input = input("提供的虚拟包 (Provides, 空格分隔) []: ").strip()
+            provides = prov_input.split() if prov_input else []
+
+        # 构建包信息
+        pkg_info = {
+            'Name': fullname,
+            'Comment': comment,
+            'Version': version,
+            'Release': rel,
+            'Registry': pkgfile,  # 使用原始 pkgfile（可能是 URL 或本地路径）
+            'Exec': exec_path,
+            'Binary': binaries,
+        }
+        if depends:
+            pkg_info['Depends'] = depends
+        if provides:
+            if isinstance(provides, str):
+                provides = [provides]
+            pkg_info['Provides'] = provides
+
+        # 子命令处理
+        if subcmd == 's':
+            # 仅输出 YAML 到 stdout
+            output = {pkgname: pkg_info}
+            yaml.dump(output, sys.stdout, allow_unicode=True, default_flow_style=False)
+            # 不保存到数据库，不安装
+            return
+
+        # 添加到数据库（子命令为 'i' 或 None）
+        self.db.add_pkg(pkgname, pkg_info)
+        logger.info(colorize(f"包 {pkgname} 已添加到数据库。", 'GREEN'))
+
+        if subcmd == 'i':
+            # 调用 install 安装该包
+            self.install([pkgname], clean_cache=False, refresh=False, upgrade_mode=False)
+
 # ---------- 命令行解析 ----------
 def print_help():
-    # 使用翻译的 help_text
     help_str = _('help_text').format(version=VERSION)
     print(help_str)
 
@@ -928,7 +1083,16 @@ def parse_args():
         'noconfirm': False,
         'debug': False,
         'config_subcmd': None,
-        'config_values': []
+        'config_values': [],
+        # NEW: publish 相关
+        'publish_subcmd': None,    # 'i' or 's' or None
+        'publish_pkgfile': None,
+        'publish_pkgname': None,
+        'publish_fullname': None,
+        'publish_version': None,
+        'publish_rel': None,
+        'publish_depends': [],
+        'publish_provides': [],
     }
     packages = []
 
@@ -937,6 +1101,8 @@ def parse_args():
     while i < len(raw):
         arg = raw[i]
         if arg.startswith('-C') and len(arg) == 3 and arg[2].islower():
+            expanded.append(arg)
+        elif arg.startswith('-U'):   # NEW: -U 不展开，整体处理
             expanded.append(arg)
         else:
             if arg.startswith('--'):
@@ -949,10 +1115,30 @@ def parse_args():
         i += 1
 
     idx = 0
+    # 先扫描长选项 --depends --provides
+    while idx < len(expanded):
+        arg = expanded[idx]
+        if arg == '--depends':
+            if idx+1 < len(expanded) and not expanded[idx+1].startswith('-'):
+                params['publish_depends'].append(expanded[idx+1])
+                idx += 2
+            else:
+                logger.error("--depends 需要参数")
+                sys.exit(1)
+        elif arg == '--provides':
+            if idx+1 < len(expanded) and not expanded[idx+1].startswith('-'):
+                params['publish_provides'].append(expanded[idx+1])
+                idx += 2
+            else:
+                logger.error("--provides 需要参数")
+                sys.exit(1)
+        else:
+            idx += 1
+
+    idx = 0
     while idx < len(expanded):
         arg = expanded[idx]
         if arg.startswith('--'):
-            # 简化长选项，忽略
             idx += 1
             continue
 
@@ -973,9 +1159,46 @@ def parse_args():
                     logger.error(_('error_missing_config_subcmd'))
                     sys.exit(1)
                 continue
+
+            # NEW: -U 处理
+            if arg.startswith('-U'):
+                op = 'publish'
+                # 提取子命令
+                if len(arg) > 2:
+                    sub = arg[2:]  # 如 -Ui -> 'i', -Us -> 's'
+                    if sub in ('i', 's'):
+                        params['publish_subcmd'] = sub
+                    else:
+                        logger.error(f"未知子命令: -U{sub}")
+                        sys.exit(1)
+                else:
+                    params['publish_subcmd'] = None
+                idx += 1
+                # 接下来解析位置参数：pkgfile, pkgname, fullname, version, rel
+                # 收集接下来的非选项参数（不包含 --depends 等）
+                pos_args = []
+                while idx < len(expanded) and not expanded[idx].startswith('-'):
+                    pos_args.append(expanded[idx])
+                    idx += 1
+                # 检查至少有 pkgfile 和 pkgname
+                if len(pos_args) < 2:
+                    logger.error("-U 需要至少 pkgfile 和 pkgname 两个参数")
+                    sys.exit(1)
+                params['publish_pkgfile'] = pos_args[0]
+                params['publish_pkgname'] = pos_args[1]
+                if len(pos_args) >= 3:
+                    params['publish_fullname'] = pos_args[2]
+                if len(pos_args) >= 4:
+                    params['publish_version'] = pos_args[3]
+                if len(pos_args) >= 5:
+                    params['publish_rel'] = pos_args[4]
+                # 多余忽略
+                continue
+
+            # 普通短选项
             for ch in arg[1:]:
                 if ch.isupper():
-                    if op is not None:
+                    if op is not None and op != 'publish':  # 如果已经设置操作且不是 publish，报错
                         logger.error(_('error_only_one_operation'))
                         sys.exit(1)
                     if ch == 'Q':
@@ -1021,15 +1244,20 @@ def parse_args():
             packages.append(arg)
             idx += 1
 
+    # 如果没有操作但有包名，则视为启动
     if op is None and packages:
         op = 'launch'
     elif op is None:
         print_help()
         sys.exit(0)
 
+    # 对于 -U，我们已经在上面设置了 op='publish'，所以在此处跳过
+    # 其他操作映射
     internal_op = op
     if op == 'sync':
         internal_op = 'install'
+    elif op == 'publish':
+        internal_op = 'publish'
 
     return {
         'op': internal_op,
@@ -1045,10 +1273,31 @@ def main():
     params = args['params']
     packages = args['packages']
 
+    # 处理 noconfirm
+    if params['noconfirm']:
+        config = Config()
+        config.set('noconfirm', True)
+    else:
+        config = Config()
+
     manager = TfvmManager()
 
     if args['original_op'] == 'config':
         manager.config_set(params['config_subcmd'], params['config_values'])
+        return
+
+    # NEW: 发布命令
+    if op == 'publish':
+        manager.publish(
+            subcmd=params['publish_subcmd'],
+            pkgfile=params['publish_pkgfile'],
+            pkgname=params['publish_pkgname'],
+            fullname=params['publish_fullname'],
+            version=params['publish_version'],
+            rel=params['publish_rel'],
+            depends=params['publish_depends'],
+            provides=params['publish_provides']
+        )
         return
 
     if op == 'install':

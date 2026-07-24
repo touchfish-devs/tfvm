@@ -229,7 +229,6 @@ class PackageDB:
     def list_pkgs(self):
         return self.packages.keys()
 
-    # NEW: 添加新包到数据库
     def add_pkg(self, name: str, pkg_info: dict):
         self.packages[name] = pkg_info
         self.save()
@@ -312,7 +311,7 @@ class TfvmManager:
     def _check_sudo_requirement(self):
         if self.config.get('sudo_at_start', False):
             if not is_root():
-                logger.error("需要 root 权限，请使用 sudo")
+                logger.error(_('sudo_required'))
                 sys.exit(1)
 
     def _download_file(self, url: str, dest: str):
@@ -322,7 +321,7 @@ class TfvmManager:
                 full_url = proxy + url
             else:
                 full_url = proxy + '/' + url
-            logger.info(f"使用代理: {proxy}")
+            logger.info(_('proxy_used').format(proxy))
         else:
             full_url = url
 
@@ -396,7 +395,7 @@ class TfvmManager:
 
         target_path = os.path.join(self.bin_dir, pkg_name)
         if existing_path == target_path:
-            return 'conflict', _('conflict_check').format(pkg_name, _('path_conflict'))
+            return 'conflict', _('path_conflict')
 
         path_list = os.environ.get('PATH', '').split(os.pathsep)
         try:
@@ -417,7 +416,6 @@ class TfvmManager:
         else:
             return 'none', ''
 
-    # ---------- 依赖解析（含 Provides） ----------
     def _resolve_dependencies_with_provides(self, pkg_names: list, upgrade_mode: bool = False):
         all_pkgs = []
         visited = set()
@@ -450,10 +448,10 @@ class TfvmManager:
                     if p_info and dep in p_info.get('Provides', []):
                         providers.append(p)
                 if not providers:
-                    logger.error(f"依赖 {dep} 未找到任何提供者（非真实包，也无 Provides）")
+                    logger.error(_('dep_no_provider').format(dep))
                     sys.exit(1)
                 if len(providers) > 1:
-                    logger.error(f"依赖 {dep} 有多个提供者：{', '.join(providers)}，无法自动选择")
+                    logger.error(_('dep_multiple_providers').format(dep, ', '.join(providers)))
                     sys.exit(1)
                 provider = providers[0]
                 if provider not in visited and provider not in queue:
@@ -481,9 +479,9 @@ class TfvmManager:
             if len(providers) > 1:
                 conflicts.append((prov, providers))
         if conflicts:
-            logger.error("Provides 冲突：")
+            logger.error(_('provides_conflict'))
             for prov, providers in conflicts:
-                logger.error(f"  {prov} 由多个包提供：{', '.join(providers)}")
+                logger.error(f"  {prov}: {', '.join(providers)}")
             sys.exit(1)
 
         return all_pkgs
@@ -493,7 +491,7 @@ class TfvmManager:
             current_version = self.installed.get_installed_version(pkg_name)
             new_version = pkg_info.get('Version')
             if current_version == "build":
-                logger.info(f"包 {pkg_name} 是 build 版本，强制重新安装")
+                logger.info(_('pkg_build_force_reinstall').format(pkg_name))
             elif current_version == new_version:
                 logger.info(_('pkg_up_to_date').format(pkg_name, current_version))
                 return
@@ -505,12 +503,12 @@ class TfvmManager:
             install_dir = info.get('install_dir')
             if symlink and os.path.islink(symlink):
                 if not run_sudo(['rm', '-f', symlink]):
-                    logger.error(f"删除旧符号链接失败: {symlink}")
+                    logger.error(_('symlink_removal_failed').format(symlink))
                     sys.exit(1)
                 logger.info(_('removed_symlink').format(symlink))
             if install_dir and os.path.exists(install_dir):
                 if not run_sudo(['rm', '-rf', install_dir]):
-                    logger.error(f"删除旧安装目录失败: {install_dir}")
+                    logger.error(_('dir_removal_failed').format(install_dir))
                     sys.exit(1)
                 logger.info(_('removed_install_dir').format(install_dir))
             self.installed.remove_pkg(pkg_name)
@@ -524,11 +522,11 @@ class TfvmManager:
 
         version = pkg_info.get('Version')
         if not version:
-            logger.error(f"包 {pkg_name} 没有 Version 字段")
+            logger.error(_('pkg_missing_version').format(pkg_name))
             sys.exit(1)
         registry_template = pkg_info.get('Registry')
         if not registry_template:
-            logger.error(f"包 {pkg_name} 没有 Registry 字段")
+            logger.error(_('pkg_missing_registry').format(pkg_name))
             sys.exit(1)
         download_url = registry_template.replace('$version$', version)
 
@@ -542,7 +540,7 @@ class TfvmManager:
                 logger.info(_('using_cache').format(cache_path))
         else:
             if not os.path.exists(cache_path):
-                logger.error(f"缓存文件缺失: {cache_path}，请先执行下载阶段")
+                logger.error(_('cache_file_missing').format(cache_path))
                 sys.exit(1)
 
         with tempfile.TemporaryDirectory(prefix='tfvm_') as tmpdir:
@@ -551,20 +549,20 @@ class TfvmManager:
                 target_dir = os.path.join(self.install_root, pkg_name)
                 if os.path.exists(target_dir):
                     if not run_sudo(['rm', '-rf', target_dir]):
-                        logger.error(f"删除旧目录失败: {target_dir}")
+                        logger.error(_('dir_removal_failed').format(target_dir))
                         sys.exit(1)
                 if not run_sudo(['mkdir', '-p', self.install_root]):
-                    logger.error(f"无法创建安装根目录: {self.install_root}")
+                    logger.error(_('mkdir_failed').format(self.install_root))
                     sys.exit(1)
                 if not run_sudo(['mkdir', '-p', target_dir]):
-                    logger.error(f"无法创建目标目录: {target_dir}")
+                    logger.error(_('mkdir_failed').format(target_dir))
                     sys.exit(1)
                 dest_file = os.path.join(target_dir, os.path.basename(cache_path))
                 if not run_sudo(['cp', cache_path, dest_file]):
-                    logger.error(f"复制 AppImage 失败")
+                    logger.error(_('copy_failed').format(cache_path, dest_file))
                     sys.exit(1)
                 if not run_sudo(['chmod', '+x', dest_file]):
-                    logger.warning(f"设置可执行权限失败: {dest_file}")
+                    logger.warning(_('chmod_failed').format(dest_file))
 
                 exec_target = pkg_info.get('Exec')
                 if exec_target:
@@ -574,12 +572,12 @@ class TfvmManager:
                 symlink_path = os.path.join(self.bin_dir, pkg_name)
                 if os.path.islink(symlink_path) or os.path.exists(symlink_path):
                     if not run_sudo(['rm', '-f', symlink_path]):
-                        logger.error(f"无法删除旧符号链接: {symlink_path}")
+                        logger.error(_('symlink_removal_failed').format(symlink_path))
                         sys.exit(1)
                 if not run_sudo(['ln', '-sf', exec_target, symlink_path]):
-                    logger.error(f"创建符号链接失败: {symlink_path} -> {exec_target}")
+                    logger.error(_('symlink_creation_failed').format(symlink_path, exec_target))
                     sys.exit(1)
-                logger.info(f"已创建符号链接: {symlink_path}")
+                logger.info(_('symlink_created').format(symlink_path))
 
                 provides = pkg_info.get('Provides', [])
                 if isinstance(provides, str):
@@ -599,46 +597,45 @@ class TfvmManager:
             target_dir = os.path.join(self.install_root, pkg_name)
             if os.path.exists(target_dir):
                 if not run_sudo(['rm', '-rf', target_dir]):
-                    logger.error(f"删除旧目录失败: {target_dir}")
+                    logger.error(_('dir_removal_failed').format(target_dir))
                     sys.exit(1)
 
             if not run_sudo(['mkdir', '-p', self.install_root]):
-                logger.error(f"无法创建安装根目录: {self.install_root}")
+                logger.error(_('mkdir_failed').format(self.install_root))
                 sys.exit(1)
             if not run_sudo(['mkdir', '-p', target_dir]):
-                logger.error(f"无法创建目标目录: {target_dir}")
+                logger.error(_('mkdir_failed').format(target_dir))
                 sys.exit(1)
             if not run_sudo(['cp', '-rT', extracted_root, target_dir]):
-                logger.error(f"复制文件到 {target_dir} 失败")
+                logger.error(_('copy_failed').format(extracted_root, target_dir))
                 sys.exit(1)
 
             binary_list = pkg_info.get('Binary', [])
             for rel_path in binary_list:
                 bin_file = os.path.join(target_dir, rel_path)
                 if not os.path.exists(bin_file):
-                    logger.warning(f"Binary 文件不存在: {bin_file}，跳过")
+                    logger.warning(_('binary_missing').format(bin_file))
                     continue
                 if not run_sudo(['chmod', '+x', bin_file]):
-                    logger.warning(f"设置可执行权限失败: {bin_file}")
+                    logger.warning(_('chmod_failed').format(bin_file))
 
             exec_rel = pkg_info.get('Exec')
             if not exec_rel:
-                logger.warning(f"包 {pkg_name} 没有 Exec 字段，不创建符号链接")
+                logger.warning(_('no_exec_field').format(pkg_name))
             else:
                 exec_target = os.path.join(target_dir, exec_rel)
                 if not os.path.exists(exec_target):
-                    logger.error(f"Exec 文件不存在: {exec_target}")
-                    logger.error("请检查数据库中的 Exec 字段是否指向包内正确的可执行文件路径")
+                    logger.error(_('exec_file_not_exists').format(exec_target))
                     sys.exit(1)
                 symlink_path = os.path.join(self.bin_dir, pkg_name)
                 if os.path.islink(symlink_path) or os.path.exists(symlink_path):
                     if not run_sudo(['rm', '-f', symlink_path]):
-                        logger.error(f"无法删除旧符号链接: {symlink_path}")
+                        logger.error(_('symlink_removal_failed').format(symlink_path))
                         sys.exit(1)
                 if not run_sudo(['ln', '-sf', exec_target, symlink_path]):
-                    logger.error(f"创建符号链接失败: {symlink_path} -> {exec_target}")
+                    logger.error(_('symlink_creation_failed').format(symlink_path, exec_target))
                     sys.exit(1)
-                logger.info(f"已创建符号链接: {symlink_path}")
+                logger.info(_('symlink_created').format(symlink_path))
 
             provides = pkg_info.get('Provides', [])
             if isinstance(provides, str):
@@ -687,7 +684,7 @@ class TfvmManager:
                 logger.info(_('no_upgradable_pkgs'))
                 return
             if self.config.get('noconfirm', False):
-                logger.info("--noconfirm 已启用，自动更新所有包")
+                logger.info(_('noconfirm_enabled'))
             else:
                 print(_('upgradable_list_header'))
                 for idx, (name, cur, new) in enumerate(upgradable):
@@ -708,9 +705,9 @@ class TfvmManager:
                                 if 0 <= idx < len(upgradable):
                                     exclude_set.add(upgradable[idx][0])
                                 else:
-                                    logger.warning(f"无效序号: {idx}")
+                                    logger.warning(_('invalid_index').format(idx))
                             except ValueError:
-                                logger.warning(f"无效输入: {part}")
+                                logger.warning(_('invalid_input').format(part))
                 if exclude_set:
                     all_pkgs = [p for p in all_pkgs if p not in exclude_set]
                     logger.info(_('excluded_pkgs').format(', '.join(exclude_set)))
@@ -739,7 +736,7 @@ class TfvmManager:
 
         logger.info(_('processing_pkgs').format(', '.join(all_pkgs)))
         if self.config.get('noconfirm', False):
-            logger.info("--noconfirm 已启用，自动确认")
+            logger.info(_('noconfirm_enabled'))
         else:
             confirm = input(colorize(_('confirm_continue'), 'YELLOW')).strip().lower()
             if confirm and confirm != 'y':
@@ -755,7 +752,7 @@ class TfvmManager:
             version = pkg_info.get('Version')
             registry_template = pkg_info.get('Registry')
             if not version or not registry_template:
-                logger.warning(f"包 {pkg} 缺少版本或 Registry，跳过")
+                logger.warning(_('pkg_skip_missing').format(pkg))
                 continue
             download_url = registry_template.replace('$version$', version)
             url_filename = os.path.basename(download_url.split('?')[0])
@@ -790,12 +787,12 @@ class TfvmManager:
             install_dir = info.get('install_dir')
             if symlink and os.path.islink(symlink):
                 if not run_sudo(['rm', '-f', symlink]):
-                    logger.error(f"删除符号链接失败: {symlink}")
+                    logger.error(_('symlink_removal_failed').format(symlink))
                     sys.exit(1)
                 logger.info(_('remove_symlink_deleted').format(symlink))
             if install_dir and os.path.exists(install_dir):
                 if not run_sudo(['rm', '-rf', install_dir]):
-                    logger.error(f"删除安装目录失败: {install_dir}")
+                    logger.error(_('dir_removal_failed').format(install_dir))
                     sys.exit(1)
                 logger.info(_('remove_dir_deleted').format(install_dir))
             self.installed.remove_pkg(name)
@@ -854,7 +851,7 @@ class TfvmManager:
                     for f in files:
                         print(os.path.join(rel, f))
             else:
-                logger.warning("安装目录不存在")
+                logger.warning(_('install_dir_not_exists'))
             return
 
         if pkg_name:
@@ -911,7 +908,7 @@ class TfvmManager:
             ensure_dir(cache_dir)
             logger.info(_('cache_purged'))
         else:
-            logger.info("缓存清理级别无效，默认只删除未安装包")
+            logger.info(_('invalid_cache_level'))
 
     def launch(self, pkg_name):
         if not self.installed.is_installed(pkg_name):
@@ -971,58 +968,54 @@ class TfvmManager:
         else:
             logger.error(_('unknown_config_subcmd').format(subcmd))
 
-    # ---------- NEW: -U 发布命令 ----------
     def publish(self, subcmd, pkgfile, pkgname, fullname=None, version=None, rel=None, depends=None, provides=None):
-        """
-        发布软件包到数据库，支持 -i 安装，-s 输出 YAML。
-        """
-        # 处理 pkgfile（本地或远程）
+        if not pkgfile:
+            logger.error(_('publish_missing_pkgfile'))
+            sys.exit(1)
+        if not pkgname:
+            logger.error(_('publish_missing_pkgname'))
+            sys.exit(1)
+
         if re.match(r'^https?://', pkgfile):
-            # 下载到临时文件
             with tempfile.NamedTemporaryFile(delete=False, suffix='.tmp') as tmp:
                 local_file = tmp.name
             self._download_file(pkgfile, local_file)
-            logger.info(f"下载包文件到: {local_file}")
+            logger.info(_('publish_downloading').format(local_file))
         else:
             if not os.path.exists(pkgfile):
-                logger.error(f"包文件不存在: {pkgfile}")
+                logger.error(_('publish_file_not_exist').format(pkgfile))
                 sys.exit(1)
             local_file = pkgfile
 
-        # 交互式补全缺失字段
+        print(_('publish_interactive_prompt'))
         if fullname is None:
-            fullname = input("全名 (Name) [包名]: ").strip() or pkgname
+            fullname = input(_('publish_missing_fullname')).strip() or pkgname
         if version is None:
-            version = input("版本 (Version) [1.0.0]: ").strip() or "1.0.0"
+            version = input(_('publish_missing_version')).strip() or "1.0.0"
         if rel is None:
-            rel_str = input("发布号 (Release) [1]: ").strip() or "1"
+            rel_str = input(_('publish_missing_release')).strip() or "1"
             try:
                 rel = int(rel_str)
             except ValueError:
                 rel = 1
-        comment = input("描述 (Comment) []: ").strip()
-        exec_path = input("可执行文件路径 (Exec) [包名]: ").strip() or pkgname
-        binary_input = input("需要可执行权限的文件列表 (Binary, 空格分隔) []: ").strip()
+        comment = input(_('publish_missing_comment')).strip()
+        exec_path = input(_('publish_missing_exec')).strip() or pkgname
+        binary_input = input(_('publish_missing_binary')).strip()
         binaries = binary_input.split() if binary_input else []
 
-        # 处理 Depends 和 Provides
         if depends is None:
-            dep_input = input("依赖 (Depends, 空格分隔) []: ").strip()
+            dep_input = input(_('publish_missing_depends')).strip()
             depends = dep_input.split() if dep_input else []
-        else:
-            # 已从命令行提供
-            pass
         if provides is None:
-            prov_input = input("提供的虚拟包 (Provides, 空格分隔) []: ").strip()
+            prov_input = input(_('publish_missing_provides')).strip()
             provides = prov_input.split() if prov_input else []
 
-        # 构建包信息
         pkg_info = {
             'Name': fullname,
             'Comment': comment,
             'Version': version,
             'Release': rel,
-            'Registry': pkgfile,  # 使用原始 pkgfile（可能是 URL 或本地路径）
+            'Registry': pkgfile,
             'Exec': exec_path,
             'Binary': binaries,
         }
@@ -1033,20 +1026,16 @@ class TfvmManager:
                 provides = [provides]
             pkg_info['Provides'] = provides
 
-        # 子命令处理
         if subcmd == 's':
-            # 仅输出 YAML 到 stdout
             output = {pkgname: pkg_info}
             yaml.dump(output, sys.stdout, allow_unicode=True, default_flow_style=False)
-            # 不保存到数据库，不安装
             return
 
-        # 添加到数据库（子命令为 'i' 或 None）
         self.db.add_pkg(pkgname, pkg_info)
-        logger.info(colorize(f"包 {pkgname} 已添加到数据库。", 'GREEN'))
+        logger.info(colorize(_('publish_added_to_db').format(pkgname), 'GREEN'))
 
         if subcmd == 'i':
-            # 调用 install 安装该包
+            logger.info(_('publish_installing'))
             self.install([pkgname], clean_cache=False, refresh=False, upgrade_mode=False)
 
 # ---------- 命令行解析 ----------
@@ -1084,8 +1073,7 @@ def parse_args():
         'debug': False,
         'config_subcmd': None,
         'config_values': [],
-        # NEW: publish 相关
-        'publish_subcmd': None,    # 'i' or 's' or None
+        'publish_subcmd': None,
         'publish_pkgfile': None,
         'publish_pkgname': None,
         'publish_fullname': None,
@@ -1102,7 +1090,7 @@ def parse_args():
         arg = raw[i]
         if arg.startswith('-C') and len(arg) == 3 and arg[2].islower():
             expanded.append(arg)
-        elif arg.startswith('-U'):   # NEW: -U 不展开，整体处理
+        elif arg.startswith('-U'):
             expanded.append(arg)
         else:
             if arg.startswith('--'):
@@ -1115,7 +1103,6 @@ def parse_args():
         i += 1
 
     idx = 0
-    # 先扫描长选项 --depends --provides
     while idx < len(expanded):
         arg = expanded[idx]
         if arg == '--depends':
@@ -1123,17 +1110,22 @@ def parse_args():
                 params['publish_depends'].append(expanded[idx+1])
                 idx += 2
             else:
-                logger.error("--depends 需要参数")
+                logger.error(_('depends_needs_arg'))
                 sys.exit(1)
         elif arg == '--provides':
             if idx+1 < len(expanded) and not expanded[idx+1].startswith('-'):
                 params['publish_provides'].append(expanded[idx+1])
                 idx += 2
             else:
-                logger.error("--provides 需要参数")
+                logger.error(_('provides_needs_arg'))
                 sys.exit(1)
-        else:
+        elif arg.startswith('--'):
+            if arg == '--noconfirm':
+                params['noconfirm'] = True
             idx += 1
+            continue
+        else:
+            break
 
     idx = 0
     while idx < len(expanded):
@@ -1160,29 +1152,24 @@ def parse_args():
                     sys.exit(1)
                 continue
 
-            # NEW: -U 处理
             if arg.startswith('-U'):
                 op = 'publish'
-                # 提取子命令
                 if len(arg) > 2:
-                    sub = arg[2:]  # 如 -Ui -> 'i', -Us -> 's'
+                    sub = arg[2:]
                     if sub in ('i', 's'):
                         params['publish_subcmd'] = sub
                     else:
-                        logger.error(f"未知子命令: -U{sub}")
+                        logger.error(_('publish_invalid_subcmd').format(sub))
                         sys.exit(1)
                 else:
                     params['publish_subcmd'] = None
                 idx += 1
-                # 接下来解析位置参数：pkgfile, pkgname, fullname, version, rel
-                # 收集接下来的非选项参数（不包含 --depends 等）
                 pos_args = []
                 while idx < len(expanded) and not expanded[idx].startswith('-'):
                     pos_args.append(expanded[idx])
                     idx += 1
-                # 检查至少有 pkgfile 和 pkgname
                 if len(pos_args) < 2:
-                    logger.error("-U 需要至少 pkgfile 和 pkgname 两个参数")
+                    logger.error(_('publish_need_pkgfile_pkgname'))
                     sys.exit(1)
                 params['publish_pkgfile'] = pos_args[0]
                 params['publish_pkgname'] = pos_args[1]
@@ -1192,13 +1179,11 @@ def parse_args():
                     params['publish_version'] = pos_args[3]
                 if len(pos_args) >= 5:
                     params['publish_rel'] = pos_args[4]
-                # 多余忽略
                 continue
 
-            # 普通短选项
             for ch in arg[1:]:
                 if ch.isupper():
-                    if op is not None and op != 'publish':  # 如果已经设置操作且不是 publish，报错
+                    if op is not None and op != 'publish':
                         logger.error(_('error_only_one_operation'))
                         sys.exit(1)
                     if ch == 'Q':
@@ -1235,7 +1220,7 @@ def parse_args():
                     elif ch == 'v':
                         params['verbose'] = True
                     else:
-                        logger.warning(f"忽略未知选项: -{ch}")
+                        logger.warning(_('ignored_option').format(ch))
                 else:
                     logger.error(_('error_invalid_char').format(ch))
                     sys.exit(1)
@@ -1244,15 +1229,12 @@ def parse_args():
             packages.append(arg)
             idx += 1
 
-    # 如果没有操作但有包名，则视为启动
     if op is None and packages:
         op = 'launch'
     elif op is None:
         print_help()
         sys.exit(0)
 
-    # 对于 -U，我们已经在上面设置了 op='publish'，所以在此处跳过
-    # 其他操作映射
     internal_op = op
     if op == 'sync':
         internal_op = 'install'
@@ -1268,25 +1250,24 @@ def parse_args():
 
 # ---------- 主函数 ----------
 def main():
+    # 先加载配置以初始化翻译（这样 print_help 等可以使用 _）
+    config = Config()
     args = parse_args()
     op = args['op']
     params = args['params']
     packages = args['packages']
 
-    # 处理 noconfirm
+    # 如果参数中有 --noconfirm，更新配置
     if params['noconfirm']:
-        config = Config()
         config.set('noconfirm', True)
-    else:
-        config = Config()
 
+    # 实例化管理器（它会再次读取配置，但 noconfirm 已保存）
     manager = TfvmManager()
 
     if args['original_op'] == 'config':
         manager.config_set(params['config_subcmd'], params['config_values'])
         return
 
-    # NEW: 发布命令
     if op == 'publish':
         manager.publish(
             subcmd=params['publish_subcmd'],

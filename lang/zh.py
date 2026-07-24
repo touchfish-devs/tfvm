@@ -1,4 +1,5 @@
 MSG = {
+    # 通用
     'loading_config': '正在加载配置...',
     'syncing_db': '正在同步软件包数据库: {}',
     'db_sync_complete': '数据库同步完成，共 {} 个软件包。',
@@ -56,11 +57,17 @@ MSG = {
   -R, --remove        移除软件包
   -S, --sync          同步/安装软件包
   -C, --config        配置管理（后接子命令）
+  -U, --publish       发布软件包到数据库
 
 配置子命令 (-C):
   -Cr <url>           修改远程数据库地址
   -Cp <proxy>         修改代理前缀（设为空字符串清除代理）
   -Ct <目录>          移动本地数据库文件到新目录
+
+发布子命令 (-U):
+  -Ui                 发布并安装
+  -Us                 仅输出 YAML（不修改数据库）
+  (无子命令)          仅发布到数据库（交互式）
 
 查询选项 (-Q):
   -i, --info          显示包的详细信息
@@ -82,6 +89,10 @@ MSG = {
   -s, --search <表达式> 在远程仓库中搜索包（未实现）
   -q, --quiet         精简输出
 
+发布选项:
+  --depends <依赖>     添加依赖（可多次）
+  --provides <提供>   添加提供的虚拟包（可多次）
+
 示例:
   tfvm -S touchfish              安装/升级 touchfish
   tfvm -Syu                      同步数据库并升级所有包（可交互排除）
@@ -90,6 +101,8 @@ MSG = {
   tfvm -Cp ""                    禁用代理
   tfvm -Ct /new/db/path          移动数据库文件
   tfvm touchfish                 启动已安装的包
+  tfvm -Ui ./pkg.tar.gz mypkg    发布并安装 mypkg
+  tfvm -Us ./pkg.tar.gz mypkg "我的应用" 1.0 1 > BUILD.yml
 """,
     'query_upgradable_header': '可更新的包：',
     'query_search_not_found': '未找到匹配的包。',
@@ -120,6 +133,36 @@ MSG = {
     'error_launch_missing_pkg': '未指定要启动的包。',
     'error_remove_missing_pkg': '未指定要卸载的包。',
     'error_unknown_op_final': '未知操作: {}',
+
+    # 新增发布相关
+    'publish_missing_fullname': '全名 (Name) [包名]: ',
+    'publish_missing_version': '版本 (Version) [1.0.0]: ',
+    'publish_missing_release': '发布号 (Release) [1]: ',
+    'publish_missing_comment': '描述 (Comment) []: ',
+    'publish_missing_exec': '可执行文件路径 (Exec) [包名]: ',
+    'publish_missing_binary': '需要可执行权限的文件列表 (Binary, 空格分隔) []: ',
+    'publish_missing_depends': '依赖 (Depends, 空格分隔) []: ',
+    'publish_missing_provides': '提供的虚拟包 (Provides, 空格分隔) []: ',
+    'publish_downloading': '下载包文件到: {}',
+    'publish_file_not_exist': '包文件不存在: {}',
+    'publish_added_to_db': '包 {} 已添加到数据库。',
+    'publish_installing': '正在安装已发布的包...',
+    'publish_output_yaml': 'YAML 输出:',
+    'publish_missing_pkgfile': '需要包文件 (pkgfile)。',
+    'publish_missing_pkgname': '需要包名 (pkgname)。',
+    'publish_invalid_subcmd': '无效子命令: {}',
+    'publish_interactive_prompt': '交互式输入（回车跳过或使用默认值）：',
+
+    # 安装过程中的错误信息
+    'pkg_missing_version': '包 {} 没有 Version 字段。',
+    'pkg_missing_registry': '包 {} 没有 Registry 字段。',
+    'exec_file_not_exists': 'Exec 文件不存在: {}',
+    'symlink_creation_failed': '创建符号链接失败: {} -> {}',
+    'binary_missing': 'Binary 文件不存在: {}',
+    'chmod_failed': '设置可执行权限失败: {}',
+    'cache_file_missing': '缓存文件缺失: {}，请先执行下载阶段。',
+    'sudo_required': '此操作需要 root 权限 (sudo)。',
+    'noconfirm_enabled': '--noconfirm 已启用，自动确认。',
 }
 def _(key):
     return MSG.get(key, key)

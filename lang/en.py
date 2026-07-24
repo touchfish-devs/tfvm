@@ -1,4 +1,5 @@
 MSG = {
+    # 通用
     'loading_config': 'Loading configuration...',
     'syncing_db': 'Syncing package database: {}',
     'db_sync_complete': 'Database sync completed, {} packages total.',
@@ -56,11 +57,17 @@ Operations:
   -R, --remove        Remove packages
   -S, --sync          Sync/Install packages
   -C, --config        Configuration management (with subcommands)
+  -U, --publish       Publish a package to the database
 
 Config subcommands (-C):
   -Cr <url>           Change remote database URL
   -Cp <proxy>         Set proxy prefix (empty to disable)
   -Ct <dir>           Move local database files to new directory
+
+Publish subcommands (-U):
+  -Ui                 Publish and install
+  -Us                 Publish and output YAML only
+  (no subcmd)         Publish to database only (interactive)
 
 Query options (-Q):
   -i, --info          Show detailed package info
@@ -82,6 +89,10 @@ Sync options (-S):
   -s, --search <expr> Search remote packages (not yet implemented)
   -q, --quiet         Quiet output
 
+Publish options:
+  --depends <dep>     Add a dependency (can be repeated)
+  --provides <prov>   Add a provides (can be repeated)
+
 Examples:
   tfvm -S touchfish              Install/upgrade touchfish
   tfvm -Syu                      Sync and upgrade all packages (interactive exclusion)
@@ -90,6 +101,8 @@ Examples:
   tfvm -Cp ""                    Disable proxy
   tfvm -Ct /new/db/path          Move database files
   tfvm touchfish                 Launch installed package
+  tfvm -Ui ./pkg.tar.gz mypkg    Publish and install mypkg
+  tfvm -Us ./pkg.tar.gz mypkg "My App" 1.0 1 > BUILD.yml
 """,
     'query_upgradable_header': 'Upgradable packages:',
     'query_search_not_found': 'No matching packages found.',
@@ -120,6 +133,36 @@ Examples:
     'error_launch_missing_pkg': 'No package specified to launch.',
     'error_remove_missing_pkg': 'No package specified to remove.',
     'error_unknown_op_final': 'Unknown operation: {}',
+
+    # 新增发布相关
+    'publish_missing_fullname': 'Full name (Name) [package name]: ',
+    'publish_missing_version': 'Version [1.0.0]: ',
+    'publish_missing_release': 'Release number [1]: ',
+    'publish_missing_comment': 'Description (Comment) []: ',
+    'publish_missing_exec': 'Executable path (Exec) [package name]: ',
+    'publish_missing_binary': 'List of binaries needing executable permission (Binary, space separated) []: ',
+    'publish_missing_depends': 'Dependencies (Depends, space separated) []: ',
+    'publish_missing_provides': 'Provided virtual packages (Provides, space separated) []: ',
+    'publish_downloading': 'Downloading package file to: {}',
+    'publish_file_not_exist': 'Package file does not exist: {}',
+    'publish_added_to_db': 'Package {} added to database.',
+    'publish_installing': 'Installing published package...',
+    'publish_output_yaml': 'YAML output:',
+    'publish_missing_pkgfile': 'Package file (pkgfile) is required.',
+    'publish_missing_pkgname': 'Package name (pkgname) is required.',
+    'publish_invalid_subcmd': 'Invalid subcommand: {}',
+    'publish_interactive_prompt': 'Interactive input (press Enter to skip or use default):',
+
+    # 安装过程中的错误信息
+    'pkg_missing_version': 'Package {} has no Version field.',
+    'pkg_missing_registry': 'Package {} has no Registry field.',
+    'exec_file_not_exists': 'Exec file does not exist: {}',
+    'symlink_creation_failed': 'Failed to create symbolic link: {} -> {}',
+    'binary_missing': 'Binary file does not exist: {}',
+    'chmod_failed': 'Failed to set executable permission: {}',
+    'cache_file_missing': 'Cache file missing: {}, please run download phase first.',
+    'sudo_required': 'This operation requires root privileges (sudo).',
+    'noconfirm_enabled': '--noconfirm enabled, auto-confirming.',
 }
 def _(key):
     return MSG.get(key, key)

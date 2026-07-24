@@ -38,6 +38,8 @@ MSG = {
     'registry_updated': 'Registry updated to: {}',
     'proxy_set': 'Proxy set to: {}',
     'proxy_cleared': 'Proxy cleared (no proxy used).',
+    'proxy_used': 'Using proxy: {}',
+    'symlink_created': 'Created symbolic link: {}',
     'db_moved': 'Moved database files to: {}',
     'db_moved_success': 'Database files moved successfully.',
     'cache_cleared': 'Cache cleared (all files).',

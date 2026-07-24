@@ -38,6 +38,8 @@ MSG = {
     'registry_updated': 'registry 已更新为: {}',
     'proxy_set': 'proxy 已设置为: {}',
     'proxy_cleared': 'proxy 已清除（不使用代理）。',
+    'proxy_used': '使用代理: {}',
+    'symlink_created': '已创建符号链接: {}',
     'db_moved': '数据库文件已移动到: {}',
     'db_moved_success': '数据库文件已转移。',
     'cache_cleared': '缓存已清理（所有文件）。',
